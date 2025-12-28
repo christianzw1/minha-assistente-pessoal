@@ -15,7 +15,7 @@ except:
     st.stop()
 
 # Inicializa o modelo (Gemma 2 9b)
-MODEL_ID = "gemma2-9b-it"
+MODEL_ID = "llama-3.3-70b-versatile"
 
 # Inicializa o histórico de chat se não existir
 if "messages" not in st.session_state:
