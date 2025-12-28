@@ -6,11 +6,12 @@ import asyncio
 import json
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
+from zoneinfo import ZoneInfo # Biblioteca de Fuso Horário Nativa
 
 # --- 1. Configuração ---
-st.set_page_config(page_title="Jarvis Proativo", page_icon="⏰")
-st.title("Assistente Pessoal (Modo Vigília)")
+st.set_page_config(page_title="Jarvis BR", page_icon="🇧🇷")
+st.title("Assistente Pessoal (Horário de Brasília)")
 
 # --- 2. Conexão ---
 try:
@@ -22,15 +23,17 @@ except:
 
 MODEL_ID = "llama-3.3-70b-versatile"
 ARQUIVO_TAREFAS = "tarefas.json"
+# Fuso Horário Oficial
+FUSO_BR = ZoneInfo("America/Sao_Paulo")
 
 # --- 3. Memória ---
 if "memoria_v3" not in st.session_state:
     st.session_state.memoria_v3 = []
 if "ultimo_audio" not in st.session_state:
     st.session_state.ultimo_audio = None
-# Controle de "Encheção de Saco" (Para não cobrar a cada milissegundo)
 if "ultima_cobranca" not in st.session_state:
-    st.session_state.ultima_cobranca = datetime.min
+    # Começa no passado para permitir cobrança imediata se necessário
+    st.session_state.ultima_cobranca = datetime.min.replace(tzinfo=FUSO_BR)
 
 def carregar_tarefas():
     if not os.path.exists(ARQUIVO_TAREFAS): return []
@@ -41,17 +44,22 @@ def carregar_tarefas():
 def salvar_tarefas(lista):
     with open(ARQUIVO_TAREFAS, "w") as f: json.dump(lista, f)
 
-# --- FUNÇÕES INTELIGENTES ---
+# --- FUNÇÕES ---
 def identificar_intencao(texto):
-    if any(x in texto.lower() for x in ["lembrar", "agendar", "anotar", "marcar"]): return "AGENDAR"
-    if any(x in texto.lower() for x in ["hoje", "preço", "notícia", "valor"]): return "BUSCAR"
+    if any(x in texto.lower() for x in ["lembrar", "agendar", "anotar", "marcar", "cobrar"]): return "AGENDAR"
+    if any(x in texto.lower() for x in ["hoje", "preço", "notícia", "valor", "dólar"]): return "BUSCAR"
     return "RESPONDER"
 
 def extrair_dados_tarefa(texto):
-    agora = datetime.now().strftime("%Y-%m-%d %H:%M")
-    prompt = f"""Hoje: {agora}. Texto: "{texto}".
-    Retorne JSON: {{"descricao": "...", "data_hora": "YYYY-MM-DD HH:MM"}}
-    Se não der hora, use 18:00."""
+    # Passamos a hora certa do Brasil para a IA não se perder
+    agora_br = datetime.now(FUSO_BR).strftime("%Y-%m-%d %H:%M")
+    prompt = f"""
+    Estamos no Brasil. Hoje e agora é: {agora_br}.
+    O usuário disse: "{texto}".
+    Extraia a tarefa e a data/hora limite.
+    Se ele disse apenas a hora (ex: 18:30), use a data de hoje.
+    Retorne JSON PURO: {{"descricao": "...", "data_hora": "YYYY-MM-DD HH:MM"}}
+    """
     try:
         resp = client.chat.completions.create(model=MODEL_ID, messages=[{"role":"user","content":prompt}], response_format={"type":"json_object"})
         return json.loads(resp.choices[0].message.content)
@@ -72,61 +80,66 @@ async def falar(t):
 # --- INTERFACE ---
 col_main, col_agenda = st.columns([0.7, 0.3])
 
-# --- O VIGIA (Lógica de Cobrança Automática) ---
-# Isso roda toda vez que a página atualiza
+# --- O VIGIA (Com Fuso Correto) ---
 tarefas = carregar_tarefas()
-agora = datetime.now()
+agora = datetime.now(FUSO_BR) # Hora Brasil
 mensagem_cobranca = None
 
 for t in tarefas:
-    data_tarefa = datetime.strptime(t['data_hora'], "%Y-%m-%d %H:%M")
-    
-    # Se já passou da hora E faz mais de 5 minutos que não cobramos
-    tempo_desde_ultima = (agora - st.session_state.ultima_cobranca).total_seconds()
-    
-    if agora > data_tarefa and tempo_desde_ultima > 300: # 300 segundos = 5 min
-        mensagem_cobranca = f"Atenção! Já passou das {t['data_hora'].split(' ')[1]} e você não marcou como feita: {t['descricao']}. Vai fazer agora?"
-        st.session_state.ultima_cobranca = agora # Marca que cobrou agora
-        break # Cobra uma por vez pra não virar bagunça
+    # Converte a data da tarefa para ter fuso horário (aware)
+    try:
+        data_tarefa = datetime.strptime(t['data_hora'], "%Y-%m-%d %H:%M").replace(tzinfo=FUSO_BR)
+        
+        # Lógica de cobrança (Intervalo de 2 minutos para teste)
+        tempo_desde_ultima = (agora - st.session_state.ultima_cobranca).total_seconds()
+        
+        if agora > data_tarefa and tempo_desde_ultima > 120: # 120s = 2 min
+            mensagem_cobranca = f"Ei! Já são {agora.strftime('%H:%M')} e a tarefa '{t['descricao']}' venceu às {t['data_hora'].split(' ')[1]}. Já fez?"
+            st.session_state.ultima_cobranca = agora
+            break
+    except:
+        pass # Ignora datas mal formatadas
 
-# Se o vigia detectou atraso, ele TOCA O TERROR (Gera áudio sozinho)
 if mensagem_cobranca:
-    # Adiciona no chat visualmente
-    st.session_state.memoria_v3.append({"role": "assistant", "content": "🔔 " + mensagem_cobranca})
-    
-    # Gera o áudio da bronca
+    # Mostra Alerta Vermelho Grande
+    st.error(mensagem_cobranca, icon="🚨")
+    st.session_state.memoria_v3.append({"role": "assistant", "content": "🚨 " + mensagem_cobranca})
     arquivo_bronca = asyncio.run(falar(mensagem_cobranca))
     st.audio(arquivo_bronca, format="audio/mp3", autoplay=True)
-    st.toast("🔔 TAREFA ATRASADA! AUMENTA O SOM!", icon="📢")
 
-
-# --- EXIBIÇÃO NORMAL ---
+# --- EXIBIÇÃO ---
 with col_agenda:
     st.subheader("📌 Agenda")
+    # RELÓGIO DE DEPURAÇÃO (Para você ver se está funcionando)
+    st.caption(f"🕒 Hora do Servidor (BR): {agora.strftime('%H:%M:%S')}")
+    
     if tarefas:
         for i, t in enumerate(tarefas):
-            st.warning(f"{t['data_hora']}\n{t['descricao']}")
-            if st.button("✅ Feito", key=i):
+            # Verifica se está atrasada para pintar de vermelho
+            cor_alerta = "🚨" if agora > datetime.strptime(t['data_hora'], "%Y-%m-%d %H:%M").replace(tzinfo=FUSO_BR) else "📅"
+            st.write(f"{cor_alerta} **{t['data_hora'].split(' ')[1]}**")
+            st.caption(t['descricao'])
+            if st.button("Concluir", key=f"del_{i}"):
                 tarefas.pop(i)
                 salvar_tarefas(tarefas)
                 st.rerun()
-    else: st.info("Livre!")
+            st.divider()
+    else:
+        st.info("Tudo limpo!")
 
 with col_main:
-    # Chat
     container = st.container()
     with container:
         for m in st.session_state.memoria_v3:
             with st.chat_message(m["role"]): st.markdown(m["content"])
 
-    # Inputs
     st.divider()
     c1, c2 = st.columns([0.15, 0.85])
     texto = None
     usou_voz = False
     
     with c2: 
-        if t := st.chat_input("Digitar..."): texto = t
+        if t := st.chat_input("Mensagem..."): texto = t
     with c1:
         if a := st.audio_input("🎙️"):
             if a != st.session_state.ultimo_audio:
@@ -135,7 +148,6 @@ with col_main:
                     texto = ouvir_audio(a)
                     usou_voz = True
 
-    # Processamento
     if texto:
         st.session_state.memoria_v3.append({"role": "user", "content": texto})
         with container.chat_message("user"): st.markdown(texto)
@@ -149,8 +161,8 @@ with col_main:
                 if d:
                     tarefas.append(d)
                     salvar_tarefas(tarefas)
-                    resp = f"Agendado: {d['descricao']} para {d['data_hora']}."
-                    st.rerun() # Atualiza a agenda na hora
+                    resp = f"Agendado para {d['data_hora']}: {d['descricao']}"
+                    st.rerun()
             
             elif "BUSCAR" in intencao:
                 if web := buscar_tavily(texto):
@@ -165,9 +177,4 @@ with col_main:
                 st.session_state.memoria_v3.append({"role": "assistant", "content": resp})
                 if usou_voz:
                     mp3 = asyncio.run(falar(resp))
-                    st.audio(mp3, format="audio/mp3", autoplay=True)
-
-# --- O CORAÇÃO DO SISTEMA (AUTO-REFRESH) ---
-# Isso faz a página recarregar sozinha a cada 30 segundos para checar tarefas
-time.sleep(30)
-st.rerun()
+                    st.audio(mp3, format="audio/mp3",
