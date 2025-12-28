@@ -1,65 +1,71 @@
 import streamlit as st
 from groq import Groq
 
-# Configuração da Página
-st.set_page_config(page_title="Minha Assistente Suprema", page_icon="🧠")
+# --- Configuração Inicial ---
+st.set_page_config(page_title="Assistente Pessoal", page_icon="🤖")
 
-st.title("Assistente Pessoal - Gemma 2")
+st.title("Minha Assistente Pessoal (Llama 3.3)")
 
-# Botão para limpar a memória se der erro
-if st.sidebar.button("🗑️ Limpar Memória"):
-    st.session_state.messages = []
-    st.rerun()
-
-# Inicializa o cliente Groq
+# --- Configuração da API ---
 try:
     client = Groq(api_key=st.secrets["GROQ_API_KEY"])
 except Exception as e:
-    st.error(f"Erro na chave da API. Verifique os Secrets. Detalhe: {e}")
+    st.error("⚠️ Erro: Chave da API não encontrada. Verifique os 'Secrets'.")
     st.stop()
 
-# Modelo Llama 3.3 (O mais inteligente e grátis)
+# Modelo atualizado e funcional
 MODEL_ID = "llama-3.3-70b-versatile"
 
-# Inicializa o histórico de chat
+# --- Gerenciamento de Memória ---
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Mostra as mensagens antigas na tela
+# Botão para limpar histórico (caso trave)
+if st.sidebar.button("🗑️ Limpar Conversa"):
+    st.session_state.messages = []
+    st.rerun()
+
+# --- 1. Mostrar Histórico na Tela ---
+# Aqui a gente protege para não tentar mostrar mensagens vazias
 for message in st.session_state.messages:
-    if message["content"]: # Só mostra se tiver conteúdo
+    if message.get("content"):
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
-# Caixa de entrada do usuário
-if prompt := st.chat_input("No que posso ajudar hoje, Christian?"):
-    # 1. Mostra a mensagem do usuário
+# --- 2. Processar Nova Mensagem ---
+if prompt := st.chat_input("Digite sua mensagem..."):
+    # Mostra mensagem do usuário
     st.chat_message("user").markdown(prompt)
     st.session_state.messages.append({"role": "user", "content": prompt})
 
-    # 2. Prepara o histórico BLINDADO (Remove mensagens vazias ou com erro)
-    safe_history = [
-        {"role": m["role"], "content": str(m["content"])} 
-        for m in st.session_state.messages 
-        if m["content"] is not None
+    # --- BLINDAGEM: Prepara histórico limpo para a IA ---
+    # Removemos qualquer mensagem que não tenha texto (None) para evitar erro 400
+    safe_messages = [
+        {"role": "system", "content": "Você é uma assistente pessoal útil e inteligente. Responda em Português do Brasil."}
     ]
+    
+    for m in st.session_state.messages:
+        if m.get("content") and isinstance(m["content"], str):
+            safe_messages.append({"role": m["role"], "content": m["content"]})
 
-    # 3. Chama a IA para responder
+    # Chama a IA
     with st.chat_message("assistant"):
         try:
             stream = client.chat.completions.create(
                 model=MODEL_ID,
-                messages=[
-                    {"role": "system", "content": "Você é uma assistente pessoal suprema, inteligente e útil. Seu nome é Gemma. Responda sempre em Português do Brasil."},
-                    *safe_history
-                ],
+                messages=safe_messages,
                 stream=True,
+                temperature=0.7
             )
+            
+            # Escreve a resposta na tela em tempo real
             response = st.write_stream(stream)
             
-            # Só salva se a resposta for válida
+            # --- SALVAMENTO SEGURO ---
+            # Só salvamos no histórico se a resposta não for vazia
             if response:
                 st.session_state.messages.append({"role": "assistant", "content": response})
                 
         except Exception as e:
             st.error(f"Erro ao gerar resposta: {e}")
+            # Se der erro, não salvamos nada corrompido no histórico
