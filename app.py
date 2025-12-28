@@ -46,3 +46,6 @@ if prompt := st.chat_input("No que posso ajudar hoje, Christian?"):
     
     # 3. Salva a resposta da IA no histórico
     st.session_state.messages.append({"role": "assistant", "content": response})
+
+
+# Atualizando servidor
