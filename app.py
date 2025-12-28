@@ -1,11 +1,12 @@
 import streamlit as st
 from groq import Groq
-from gtts import gTTS
+import edge_tts
+import asyncio
 import os
 
 # --- 1. Configuração ---
-st.set_page_config(page_title="Jarvis Pessoal", page_icon="🎙️")
-st.title("Assistente Pessoal (Modo Voz)")
+st.set_page_config(page_title="Jarvis Neural", page_icon="🎙️")
+st.title("Assistente Pessoal (Voz Neural)")
 
 # --- 2. Conexão ---
 try:
@@ -16,108 +17,116 @@ except Exception as e:
 
 MODEL_ID = "llama-3.3-70b-versatile"
 
-# --- 3. Gerenciamento de Memória (Blindado) ---
+# --- 3. Memória Blindada ---
 if "memoria_v3" not in st.session_state:
     st.session_state.memoria_v3 = []
 
-# Botão para limpar
-if st.sidebar.button("🗑️ Nova Conversa"):
+# Botão de limpeza discreto na sidebar
+if st.sidebar.button("🗑️ Limpar Memória"):
     st.session_state.memoria_v3 = []
     st.rerun()
 
-# --- FUNÇÕES DE VOZ ---
+# --- FUNÇÕES DE ÁUDIO ---
 
-def ouvir_audio(audio_bytes):
-    """Usa o Whisper da Groq para transcrever áudio em texto"""
+def ouvir_audio_whisper(audio_bytes):
+    """Ouvidos: Transcreve o áudio usando Groq Whisper (Rápido)"""
     try:
-        transcription = client.audio.transcriptions.create(
+        return client.audio.transcriptions.create(
             file=("temp.wav", audio_bytes, "audio/wav"),
-            model="whisper-large-v3", # Modelo de ouvido da Groq
+            model="whisper-large-v3",
             response_format="text",
             language="pt"
         )
-        return transcription
     except Exception as e:
         st.error(f"Erro ao ouvir: {e}")
         return None
 
-def falar_texto(texto):
-    """Transforma texto em áudio usando Google TTS"""
-    try:
-        tts = gTTS(text=texto, lang='pt', slow=False)
-        filename = "resposta_audio.mp3"
-        tts.save(filename)
-        return filename
-    except Exception as e:
-        st.warning(f"Não consegui gerar o áudio: {e}")
-        return None
+async def gerar_audio_neural(texto):
+    """Boca: Gera áudio neural usando Edge-TTS (Microsoft Azure Free)"""
+    OUTPUT_FILE = "resposta_neural.mp3"
+    # Vozes PT-BR disponíveis: 'pt-BR-FranciscaNeural' (Mulher) ou 'pt-BR-AntonioNeural' (Homem)
+    VOICE = "pt-BR-FranciscaNeural" 
+    
+    communicate = edge_tts.Communicate(texto, VOICE)
+    await communicate.save(OUTPUT_FILE)
+    return OUTPUT_FILE
 
-# --- 4. Interface ---
+# --- 4. Interface de Chat ---
+# Container para o histórico (deixa espaço para os inputs embaixo)
+chat_container = st.container()
 
-# Mostra o histórico visual
-for message in st.session_state.memoria_v3:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+with chat_container:
+    for message in st.session_state.memoria_v3:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
 
-# --- 5. Entradas (Voz ou Texto) ---
-col1, col2 = st.columns([0.8, 0.2])
+# --- 5. Área de Input (Híbrida) ---
+# Usamos um container fixo ou a parte inferior para organizar
+st.divider() # Linha separadora
+col_audio, col_texto = st.columns([0.2, 0.8]) # Layout lado a lado (aprox)
 
-# Variável para guardar o prompt final
-prompt_usuario = None
+prompt_final = None
 usou_audio = False
 
-# A. Entrada de Áudio (Novo!)
-audio_gravado = st.audio_input("🎙️ Clique para gravar")
+# Input de Áudio (Novo Widget Compacto)
+with col_audio:
+    audio_gravado = st.audio_input("🎙️") # Ícone minimalista
 
+# Input de Texto
+with col_texto:
+    prompt_texto = st.chat_input("Digite ou grave ao lado...")
+
+# Lógica de Prioridade (Quem mandar primeiro, ganha)
 if audio_gravado:
-    with st.spinner("Ouvindo..."):
-        texto_transcrito = ouvir_audio(audio_gravado)
-        if texto_transcrito:
-            prompt_usuario = texto_transcrito
-            usou_audio = True
+    with st.spinner("Processando voz..."):
+        prompt_final = ouvir_audio_whisper(audio_gravado)
+        usou_audio = True
+elif prompt_texto:
+    prompt_final = prompt_texto
 
-# B. Entrada de Texto (Backup)
-prompt_texto = st.chat_input("Ou digite aqui...")
-if prompt_texto:
-    prompt_usuario = prompt_texto
-
-# --- 6. Processamento ---
-if prompt_usuario:
-    # Mostra mensagem do usuário
-    if not usou_audio: # Se for áudio, o player já aparece, não duplicamos texto
-        with st.chat_message("user"):
-            st.markdown(prompt_usuario)
+# --- 6. Processamento Inteligente ---
+if prompt_final:
+    # Mostra mensagem do usuário (se for texto, o chat input já mostra, se for áudio forçamos)
+    if usou_audio:
+        with chat_container.chat_message("user"):
+            st.markdown(prompt_final)
     
-    st.session_state.memoria_v3.append({"role": "user", "content": prompt_usuario})
+    st.session_state.memoria_v3.append({"role": "user", "content": prompt_final})
 
-    # Gera resposta da IA
-    with st.chat_message("assistant"):
-        with st.spinner("Pensando..."):
-            try:
-                # Prepara histórico limpo
-                messages_api = [{"role": "system", "content": "Você é uma assistente útil. Responda de forma direta e amigável em Português."}]
-                for m in st.session_state.memoria_v3:
-                    if m.get("content"):
-                        messages_api.append({"role": m["role"], "content": str(m["content"])})
+    # Resposta da IA
+    with chat_container.chat_message("assistant"):
+        placeholder_texto = st.empty()
+        placeholder_audio = st.empty()
+        
+        try:
+            # 1. Filtro de Segurança
+            msgs_api = [{"role": "system", "content": "Você é uma assistente útil, carismática e direta. Responda em Português."}]
+            for m in st.session_state.memoria_v3:
+                if m.get("content"):
+                    msgs_api.append({"role": m["role"], "content": str(m["content"])})
 
-                # Chama Llama 3
+            # 2. Gera Texto (Llama 3)
+            with st.spinner("Pensando..."):
                 completion = client.chat.completions.create(
                     model=MODEL_ID,
-                    messages=messages_api,
+                    messages=msgs_api,
                     stream=False
                 )
-                
-                resposta = completion.choices[0].message.content
-                st.markdown(resposta)
-                
-                # Gera o Áudio da resposta
-                if usou_audio: # Só fala se o usuário falou com ela (para não ser chato no chat de texto)
-                    arquivo_audio = falar_texto(resposta)
+                resposta_texto = completion.choices[0].message.content
+                placeholder_texto.markdown(resposta_texto)
+
+            # 3. Gera Áudio Neural (Se o usuário falou por voz)
+            if usou_audio:
+                with st.spinner("Gerando voz natural..."):
+                    # Roda o Edge-TTS (Assíncrono)
+                    arquivo_audio = asyncio.run(gerar_audio_neural(resposta_texto))
+                    
+                    # Toca o áudio automaticamente
                     if arquivo_audio:
-                        st.audio(arquivo_audio, format="audio/mp3", autoplay=True)
+                        placeholder_audio.audio(arquivo_audio, format="audio/mp3", autoplay=True)
 
-                # Salva na memória
-                st.session_state.memoria_v3.append({"role": "assistant", "content": resposta})
+            # 4. Salva Memória
+            st.session_state.memoria_v3.append({"role": "assistant", "content": resposta_texto})
 
-            except Exception as e:
-                st.error(f"Erro: {e}")
+        except Exception as e:
+            st.error(f"Ocorreu um erro: {e}")
