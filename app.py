@@ -7,11 +7,11 @@ import json
 import os
 import time
 from datetime import datetime
-from zoneinfo import ZoneInfo # Biblioteca de Fuso Horário
+from zoneinfo import ZoneInfo
 
 # --- 1. Configuração ---
-st.set_page_config(page_title="Jarvis BR", page_icon="🇧🇷")
-st.title("Assistente Pessoal (Horário de Brasília)")
+st.set_page_config(page_title="Jarvis Proativo", page_icon="⏰")
+st.title("Assistente Pessoal (Vigília 2.0)")
 
 # --- 2. Conexão ---
 try:
@@ -23,7 +23,7 @@ except:
 
 MODEL_ID = "llama-3.3-70b-versatile"
 ARQUIVO_TAREFAS = "tarefas.json"
-FUSO_BR = ZoneInfo("America/Sao_Paulo") # Fuso Horário Oficial
+FUSO_BR = ZoneInfo("America/Sao_Paulo")
 
 # --- 3. Memória ---
 if "memoria_v3" not in st.session_state:
@@ -42,15 +42,15 @@ def carregar_tarefas():
 def salvar_tarefas(lista):
     with open(ARQUIVO_TAREFAS, "w") as f: json.dump(lista, f)
 
-# --- FUNÇÕES INTELIGENTES ---
+# --- CÉREBRO CORRIGIDO (Detector Flexível) ---
 def identificar_intencao(texto):
     texto = texto.lower()
-    # CORREÇÃO: Usamos partes das palavras para pegar "lembre", "lembrar", "lembra"
-    palavras_chave_agenda = ["lembr", "agend", "anota", "marca", "cobr", "avis"]
+    # AGORA PEGA TUDO: "lembr" pega (lembre, lembrar, lembrete)...
+    palavras_chave = ["lembr", "agend", "anot", "marc", "cobr", "avis"]
     
-    if any(p in texto for p in palavras_chave_agenda): 
+    if any(p in texto for p in palavras_chave):
         return "AGENDAR"
-    if any(x in texto for x in ["hoje", "preço", "notícia", "valor", "dólar", "tempo"]): 
+    if any(x in texto for x in ["hoje", "preço", "notícia", "valor", "dólar", "tempo"]):
         return "BUSCAR"
     return "RESPONDER"
 
@@ -58,10 +58,10 @@ def extrair_dados_tarefa(texto):
     agora_br = datetime.now(FUSO_BR).strftime("%Y-%m-%d %H:%M")
     prompt = f"""
     Estamos no Brasil. Agora é: {agora_br}.
-    O usuário disse: "{texto}".
-    Extraia a tarefa e a data/hora limite.
-    Se ele disse apenas a hora (ex: 18:30), use a data de hoje.
-    Retorne JSON PURO: {{"descricao": "...", "data_hora": "YYYY-MM-DD HH:MM"}}
+    User: "{texto}".
+    Extraia a tarefa e a data/hora limite (formato YYYY-MM-DD HH:MM).
+    Se não houver hora explícita, defina para as 18:00 de hoje.
+    Responda APENAS o JSON: {{"descricao": "...", "data_hora": "..."}}
     """
     try:
         resp = client.chat.completions.create(model=MODEL_ID, messages=[{"role":"user","content":prompt}], response_format={"type":"json_object"})
@@ -83,7 +83,7 @@ async def falar(t):
 # --- INTERFACE ---
 col_main, col_agenda = st.columns([0.7, 0.3])
 
-# --- O VIGIA (Com Fuso Correto) ---
+# --- O VIGIA (Frequência de Cobrança: 30s) ---
 tarefas = carregar_tarefas()
 agora = datetime.now(FUSO_BR)
 mensagem_cobranca = None
@@ -93,37 +93,36 @@ for t in tarefas:
         data_tarefa = datetime.strptime(t['data_hora'], "%Y-%m-%d %H:%M").replace(tzinfo=FUSO_BR)
         tempo_desde_ultima = (agora - st.session_state.ultima_cobranca).total_seconds()
         
-        # Cobra se passou da hora e faz mais de 2 minutos que não fala
-        if agora > data_tarefa and tempo_desde_ultima > 120:
-            mensagem_cobranca = f"Ei! Já são {agora.strftime('%H:%M')} e a tarefa '{t['descricao']}' venceu às {t['data_hora'].split(' ')[1]}. Já fez?"
+        # Se passou da hora E faz mais de 30 segundos da última bronca
+        if agora > data_tarefa and tempo_desde_ultima > 30:
+            mensagem_cobranca = f"Ei! Já são {agora.strftime('%H:%M')} e você não fez: {t['descricao']}!"
             st.session_state.ultima_cobranca = agora
             break
     except: pass
 
 if mensagem_cobranca:
-    st.error(mensagem_cobranca, icon="🚨")
-    st.session_state.memoria_v3.append({"role": "assistant", "content": "🚨 " + mensagem_cobranca})
+    st.error(mensagem_cobranca, icon="🔔")
+    st.session_state.memoria_v3.append({"role": "assistant", "content": "🔔 " + mensagem_cobranca})
     arquivo_bronca = asyncio.run(falar(mensagem_cobranca))
     st.audio(arquivo_bronca, format="audio/mp3", autoplay=True)
 
-# --- EXIBIÇÃO ---
+# --- SIDEBAR AGENDA ---
 with col_agenda:
     st.subheader("📌 Agenda")
-    st.caption(f"🕒 Hora Brasil: {agora.strftime('%H:%M:%S')}")
+    st.caption(f"🕒 {agora.strftime('%H:%M:%S')}")
     
     if tarefas:
         for i, t in enumerate(tarefas):
-            cor_alerta = "🚨" if agora > datetime.strptime(t['data_hora'], "%Y-%m-%d %H:%M").replace(tzinfo=FUSO_BR) else "📅"
-            st.write(f"{cor_alerta} **{t['data_hora'].split(' ')[1]}**")
-            st.caption(t['descricao'])
-            if st.button("Concluir", key=f"del_{i}"):
+            atrasada = agora > datetime.strptime(t['data_hora'], "%Y-%m-%d %H:%M").replace(tzinfo=FUSO_BR)
+            icone = "🔥" if atrasada else "📅"
+            st.warning(f"{icone} {t['data_hora'].split(' ')[1]}\n{t['descricao']}")
+            if st.button("Feito", key=f"d{i}"):
                 tarefas.pop(i)
                 salvar_tarefas(tarefas)
                 st.rerun()
-            st.divider()
-    else:
-        st.info("Tudo limpo!")
+    else: st.success("Livre!")
 
+# --- CHAT PRINCIPAL ---
 with col_main:
     container = st.container()
     with container:
@@ -151,32 +150,38 @@ with col_main:
         
         with container.chat_message("assistant"):
             intencao = identificar_intencao(texto)
-            resp = ""
             
-            if "AGENDAR" in intencao:
+            # FEEDBACK VISUAL (Para você saber se funcionou)
+            if intencao == "AGENDAR":
+                st.toast("📅 Entendi: Vou agendar!", icon="✅")
                 d = extrair_dados_tarefa(texto)
                 if d:
                     tarefas.append(d)
                     salvar_tarefas(tarefas)
-                    resp = f"Agendado para {d['data_hora']}: {d['descricao']}"
+                    st.success(f"Agendado: **{d['descricao']}** às {d['data_hora']}")
                     st.rerun()
             
-            elif "BUSCAR" in intencao:
-                if web := buscar_tavily(texto):
-                    resp = client.chat.completions.create(model=MODEL_ID, messages=[{"role":"user","content":f"Dados: {web}. Pergunta: {texto}"}]).choices[0].message.content
-            
-            else:
-                msgs = [{"role":"system","content":"Assistente útil."}] + [{"role":m["role"],"content":str(m["content"])} for m in st.session_state.memoria_v3]
-                resp = client.chat.completions.create(model=MODEL_ID, messages=msgs).choices[0].message.content
-
-            if resp:
+            elif intencao == "BUSCAR":
+                st.toast("🌍 Buscando na web...", icon="🔍")
+                web = buscar_tavily(texto)
+                resp = client.chat.completions.create(model=MODEL_ID, messages=[{"role":"user","content":f"Dados: {web}. Pergunta: {texto}"}]).choices[0].message.content
                 st.markdown(resp)
                 st.session_state.memoria_v3.append({"role": "assistant", "content": resp})
+            
+            else:
+                st.toast("💬 Apenas conversando...", icon="🤖")
+                # Instrução para NÃO mentir sobre agendamentos
+                msgs = [{"role":"system","content":"Você é uma assistente. Se o usuário pedir para agendar algo e você caiu aqui, diga: 'Por favor, use a palavra AGENDAR ou LEMBRAR'."}] 
+                for m in st.session_state.memoria_v3:
+                    if m.get("content"): msgs.append({"role":m["role"],"content":str(m["content"])})
+                
+                resp = client.chat.completions.create(model=MODEL_ID, messages=msgs).choices[0].message.content
+                st.markdown(resp)
+                st.session_state.memoria_v3.append({"role": "assistant", "content": resp})
+                
                 if usou_voz:
                     mp3 = asyncio.run(falar(resp))
-                    # AQUI ESTAVA O ERRO, AGORA ESTÁ CORRIGIDO:
                     st.audio(mp3, format="audio/mp3", autoplay=True)
 
-# Loop de Vigília (10 segundos)
 time.sleep(10)
 st.rerun()
