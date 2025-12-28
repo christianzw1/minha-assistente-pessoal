@@ -18,7 +18,7 @@ try:
     client = Groq(api_key=st.secrets["GROQ_API_KEY"])
     tavily = TavilyClient(api_key=st.secrets["TAVILY_API_KEY"])
 except:
-    st.error("⚠️ Erro nas Chaves API.")
+    st.error("⚠️ Erro nas Chaves API. Verifique os Secrets.")
     st.stop()
 
 MODEL_ID = "llama-3.3-70b-versatile"
@@ -46,7 +46,7 @@ def salvar_tarefas(lista):
 def identificar_intencao(texto):
     texto = texto.lower()
     
-    # 1. CONCLUIR TAREFA (Novo!)
+    # 1. CONCLUIR TAREFA (O segredo para ela apagar)
     termos_conclusao = ["já fiz", "já fechei", "feito", "conclu", "termin", "apaga", "remove", "tá pronto", "ta pronto"]
     if any(t in texto for t in termos_conclusao):
         return "CONCLUIR"
@@ -127,7 +127,8 @@ for t in tarefas:
         data_tarefa = datetime.strptime(t['data_hora'], "%Y-%m-%d %H:%M").replace(tzinfo=FUSO_BR)
         tempo_desde_ultima = (agora - st.session_state.ultima_cobranca).total_seconds()
         
-        if agora > data_tarefa and tempo_desde_ultima > 60: # Cobra a cada 1 min
+        # Cobra se passou da hora E faz mais de 60 segundos da última bronca
+        if agora > data_tarefa and tempo_desde_ultima > 60:
             mensagem_cobranca = f"Ei! Já são {agora.strftime('%H:%M')} e a tarefa '{t['descricao']}' venceu! Já fez?"
             st.session_state.ultima_cobranca = agora
             break
@@ -182,15 +183,17 @@ with col_main:
         with container.chat_message("assistant"):
             intencao = identificar_intencao(texto)
             
-            # --- FLUXO DE CONCLUSÃO (NOVO) ---
+            # --- ROTA: CONCLUIR (NOVA!) ---
             if intencao == "CONCLUIR":
                 if not tarefas:
                     st.info("Sua agenda já está vazia!")
                 else:
+                    # Usa a IA para descobrir qual tarefa apagar
                     indice = encontrar_tarefa_para_remover(texto, tarefas)
                     if indice != -1:
                         removida = tarefas.pop(indice)
                         salvar_tarefas(tarefas)
+                        
                         msg_confirmacao = f"Maravilha! Marquei como feito: '{removida['descricao']}'."
                         st.success(msg_confirmacao)
                         st.session_state.memoria_v3.append({"role": "assistant", "content": "✅ " + msg_confirmacao})
@@ -199,12 +202,12 @@ with col_main:
                             mp3 = asyncio.run(falar("Maravilha! Tarefa concluída."))
                             st.audio(mp3, format="audio/mp3", autoplay=True)
                         
-                        time.sleep(2) # Dá tempo de ouvir antes de recarregar
+                        time.sleep(2) # Pausa dramática antes de limpar
                         st.rerun()
                     else:
                         st.warning("Não encontrei essa tarefa na sua lista.")
 
-            # --- FLUXO DE AGENDAMENTO ---
+            # --- ROTA: AGENDAR ---
             elif intencao == "AGENDAR":
                 d = extrair_dados_tarefa(texto)
                 if d:
@@ -213,14 +216,14 @@ with col_main:
                     st.success(f"Agendado: **{d['descricao']}**")
                     st.rerun()
             
-            # --- FLUXO DE BUSCA ---
+            # --- ROTA: BUSCAR ---
             elif intencao == "BUSCAR":
                 if web := buscar_tavily(texto):
                     resp = client.chat.completions.create(model=MODEL_ID, messages=[{"role":"user","content":f"Dados: {web}. Pergunta: {texto}"}]).choices[0].message.content
                     st.markdown(resp)
                     st.session_state.memoria_v3.append({"role": "assistant", "content": resp})
             
-            # --- FLUXO PADRÃO ---
+            # --- ROTA: CONVERSA ---
             else:
                 msgs = [{"role":"system","content":"Assistente útil."}] + [{"role":m["role"],"content":str(m["content"])} for m in st.session_state.memoria_v3]
                 resp = client.chat.completions.create(model=MODEL_ID, messages=msgs).choices[0].message.content
