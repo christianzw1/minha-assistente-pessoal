@@ -3,3 +3,4 @@ groq
 edge-tts
 asyncio
 tavily-python
+streamlit-autorefresh
