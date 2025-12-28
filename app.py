@@ -41,82 +41,100 @@ AUTO_REFRESH_MS = 5_000  # 5s
 # CSS / UI POLISH
 # =========================
 def inject_css():
+    # --- META TAGS PARA MODO "APP" (Mobile Fullscreen) ---
+    st.markdown(
+        """
+        <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=0">
+        <meta name="apple-mobile-web-app-capable" content="yes">
+        <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+        """,
+        unsafe_allow_html=True
+    )
+
+    # --- CSS AGRESSIVO ---
     st.markdown(
         """
         <style>
-        /* ----- Page width + spacing ----- */
-        .block-container {
-            max-width: 1100px;
-            padding-top: 28px;
-            padding-bottom: 40px;
-        }
-
-        /* ----- Hide Streamlit chrome (menu/footer/toolbar) ----- */
-        #MainMenu { visibility: hidden; }
-        footer { visibility: hidden; }
-        header { visibility: hidden; }
-
-        /* tenta esconder toolbars/overlays (funciona em várias versões) */
+        /* Remove barras do Streamlit (cabeçalho, rodapé, menu) */
+        header[data-testid="stHeader"] { display: none !important; }
+        footer { display: none !important; }
+        #MainMenu { display: none !important; }
+        .stDeployButton { display: none !important; }
         [data-testid="stToolbar"] { display: none !important; }
         [data-testid="stDecoration"] { display: none !important; }
         [data-testid="stStatusWidget"] { display: none !important; }
-        [data-testid="stDeployButton"] { display: none !important; }
-        .stDeployButton { display: none !important; }
-
-        /* ----- Background vibe ----- */
-        [data-testid="stAppViewContainer"] {
-            background: radial-gradient(1200px 600px at 10% 0%, rgba(120,80,255,0.15), transparent 55%),
-                        radial-gradient(1000px 500px at 90% 10%, rgba(0,200,255,0.12), transparent 55%),
-                        radial-gradient(900px 450px at 40% 90%, rgba(0,255,170,0.08), transparent 55%),
-                        linear-gradient(180deg, rgba(10,14,25,1) 0%, rgba(6,10,18,1) 100%);
+        
+        /* Remove o botão "Manage App" se possível (depende do host) */
+        .viewerBadge_container__1QSob { display: none !important; }
+        
+        /* Ajuste de layout para Mobile (Remove padding excessivo) */
+        .block-container {
+            padding-top: 10px !important;
+            padding-bottom: 60px !important;
+            padding-left: 1rem !important;
+            padding-right: 1rem !important;
+            max-width: 100%;
         }
 
-        /* ----- Cards ----- */
+        /* Fundo estilo Cyberpunk/Dark Modern */
+        [data-testid="stAppViewContainer"] {
+            background: radial-gradient(1200px 600px at 10% 0%, rgba(12, 16, 33, 1), transparent 55%),
+                        radial-gradient(1000px 500px at 90% 10%, rgba(0, 0, 0, 1), transparent 55%),
+                        linear-gradient(180deg, #0e1117 0%, #000000 100%);
+        }
+
+        /* Cards mais limpos */
         .card {
-            border: 1px solid rgba(255,255,255,0.08);
-            background: rgba(255,255,255,0.03);
-            border-radius: 16px;
-            padding: 16px 16px;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.25);
+            border: 1px solid rgba(255,255,255,0.05);
+            background: rgba(20, 24, 35, 0.6);
+            backdrop-filter: blur(10px);
+            border-radius: 12px;
+            padding: 14px;
+            margin-bottom: 10px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
         }
         .card-title {
-            font-size: 18px;
-            font-weight: 700;
-            margin-bottom: 6px;
+            font-size: 16px;
+            font-weight: 600;
+            color: #e0e0e0;
+            margin-bottom: 4px;
         }
         .muted {
-            opacity: 0.75;
-            font-size: 13px;
+            opacity: 0.6;
+            font-size: 12px;
+            color: #a0a0a0;
         }
 
-        /* ----- Tabs nicer ----- */
-        [data-testid="stTabs"] button {
-            border-radius: 999px !important;
-            padding: 10px 14px !important;
-        }
-
-        /* ----- Make chat input area breathe ----- */
+        /* Input de chat flutuante na parte inferior (estilo WhatsApp) */
         [data-testid="stChatInput"] {
-            border-radius: 14px;
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            padding: 1rem;
+            background: rgba(14, 17, 23, 0.95);
+            z-index: 999;
+            border-top: 1px solid rgba(255,255,255,0.1);
+        }
+        
+        /* Ajusta o botão de Audio Input para alinhar com o chat */
+        [data-testid="stAudioInput"] {
+             transform: scale(0.9);
         }
 
-        /* ----- Buttons radius ----- */
-        .stButton button {
-            border-radius: 12px !important;
-            padding: 8px 12px !important;
+        /* Esconde barras de rolagem feias */
+        ::-webkit-scrollbar {
+            width: 4px;
+            background: transparent;
         }
-
-        /* ----- Mobile tweaks ----- */
-        @media (max-width: 768px) {
-            .block-container { padding-top: 18px; }
+        ::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 4px;
         }
         </style>
         """,
         unsafe_allow_html=True,
     )
-
-inject_css()
-
 
 # =========================
 # CONEXÕES
