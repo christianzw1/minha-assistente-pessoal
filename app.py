@@ -3,167 +3,171 @@ from groq import Groq
 from tavily import TavilyClient
 import edge_tts
 import asyncio
+import json
+import os
+import time
+from datetime import datetime, timedelta
 
 # --- 1. Configuração ---
-st.set_page_config(page_title="IA Personalizável", page_icon="🎭")
+st.set_page_config(page_title="Jarvis Proativo", page_icon="⏰")
+st.title("Assistente Pessoal (Modo Vigília)")
 
 # --- 2. Conexão ---
 try:
     client = Groq(api_key=st.secrets["GROQ_API_KEY"])
     tavily = TavilyClient(api_key=st.secrets["TAVILY_API_KEY"])
-except Exception as e:
-    st.error("⚠️ Erro nas Chaves API. Verifique os Secrets.")
+except:
+    st.error("⚠️ Erro nas Chaves API.")
     st.stop()
 
 MODEL_ID = "llama-3.3-70b-versatile"
+ARQUIVO_TAREFAS = "tarefas.json"
 
 # --- 3. Memória ---
 if "memoria_v3" not in st.session_state:
     st.session_state.memoria_v3 = []
 if "ultimo_audio" not in st.session_state:
     st.session_state.ultimo_audio = None
+# Controle de "Encheção de Saco" (Para não cobrar a cada milissegundo)
+if "ultima_cobranca" not in st.session_state:
+    st.session_state.ultima_cobranca = datetime.min
 
-# --- 4. SIDEBAR (O Centro de Comando) ---
-with st.sidebar:
-    st.title("⚙️ Configurações")
-    
-    # A. Identidade
-    st.subheader("Identidade")
-    nome_ia = st.text_input("Nome da IA:", value="Jarvis")
-    personalidade = st.text_area("Personalidade / Instruções:", 
-                                 value="Você é um assistente extremamente inteligente, sarcástico e direto. Você não gosta de enrolação.",
-                                 height=100)
-    
-    # B. Recursos
-    st.subheader("Recursos")
-    modo_internet = st.toggle("🌍 Acesso à Internet", value=True)
-    
-    # C. Limpeza
-    st.divider()
-    if st.button("🗑️ Resetar Memória"):
-        st.session_state.memoria_v3 = []
-        st.session_state.ultimo_audio = None
-        st.rerun()
-
-st.title(f"Chat com {nome_ia}")
-
-# --- FUNÇÕES ---
-
-def cerebro_decisor(pergunta):
-    """Decide se busca ou responde (Mantido para eficiência)"""
-    termos_obrigatorios = ["hoje", "agora", "cotação", "preço", "valor", "notícia", "tempo", "dólar", "quem ganhou"]
-    if any(termo in pergunta.lower() for termo in termos_obrigatorios): return True
-
-    system_prompt = "Você é um classificador. Se a pergunta precisa de dados recentes/reais, responda 'BUSCAR'. Se não, 'RESPONDER'."
+def carregar_tarefas():
+    if not os.path.exists(ARQUIVO_TAREFAS): return []
     try:
-        completion = client.chat.completions.create(
-            model=MODEL_ID,
-            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": pergunta}],
-            temperature=0
-        )
-        return "BUSCAR" in completion.choices[0].message.content.strip().upper()
-    except: return False
+        with open(ARQUIVO_TAREFAS, "r") as f: return json.load(f)
+    except: return []
 
-def buscar_tavily(pergunta):
+def salvar_tarefas(lista):
+    with open(ARQUIVO_TAREFAS, "w") as f: json.dump(lista, f)
+
+# --- FUNÇÕES INTELIGENTES ---
+def identificar_intencao(texto):
+    if any(x in texto.lower() for x in ["lembrar", "agendar", "anotar", "marcar"]): return "AGENDAR"
+    if any(x in texto.lower() for x in ["hoje", "preço", "notícia", "valor"]): return "BUSCAR"
+    return "RESPONDER"
+
+def extrair_dados_tarefa(texto):
+    agora = datetime.now().strftime("%Y-%m-%d %H:%M")
+    prompt = f"""Hoje: {agora}. Texto: "{texto}".
+    Retorne JSON: {{"descricao": "...", "data_hora": "YYYY-MM-DD HH:MM"}}
+    Se não der hora, use 18:00."""
     try:
-        response = tavily.search(query=pergunta, search_depth="basic", max_results=3)
-        contexto = []
-        for r in response.get('results', []):
-            contexto.append(f"- {r['title']}: {r['content']}")
-        return "\n".join(contexto)
+        resp = client.chat.completions.create(model=MODEL_ID, messages=[{"role":"user","content":prompt}], response_format={"type":"json_object"})
+        return json.loads(resp.choices[0].message.content)
     except: return None
 
-def ouvir_audio(audio_bytes):
-    try:
-        return client.audio.transcriptions.create(
-            file=("temp.wav", audio_bytes, "audio/wav"),
-            model="whisper-large-v3",
-            response_format="text",
-            language="pt"
-        )
+def buscar_tavily(q):
+    try: return tavily.search(query=q, max_results=2)['results'][0]['content']
     except: return None
 
-async def falar(texto):
-    OUTPUT = "resposta.mp3"
-    VOICE = "pt-BR-FranciscaNeural"
-    await edge_tts.Communicate(texto, VOICE).save(OUTPUT)
-    return OUTPUT
+def ouvir_audio(b):
+    try: return client.audio.transcriptions.create(file=("t.wav", b, "audio/wav"), model="whisper-large-v3", response_format="text", language="pt")
+    except: return None
+
+async def falar(t):
+    await edge_tts.Communicate(t, "pt-BR-FranciscaNeural").save("alerta.mp3")
+    return "alerta.mp3"
 
 # --- INTERFACE ---
-chat_container = st.container()
-with chat_container:
-    for m in st.session_state.memoria_v3:
-        with st.chat_message(m["role"]):
-            st.markdown(m["content"])
+col_main, col_agenda = st.columns([0.7, 0.3])
 
-st.divider()
-col1, col2 = st.columns([0.2, 0.8])
-texto_input = None
-falar_resposta = False
+# --- O VIGIA (Lógica de Cobrança Automática) ---
+# Isso roda toda vez que a página atualiza
+tarefas = carregar_tarefas()
+agora = datetime.now()
+mensagem_cobranca = None
 
-with col2:
-    if txt := st.chat_input(f"Fale com {nome_ia}..."):
-        texto_input = txt
+for t in tarefas:
+    data_tarefa = datetime.strptime(t['data_hora'], "%Y-%m-%d %H:%M")
+    
+    # Se já passou da hora E faz mais de 5 minutos que não cobramos
+    tempo_desde_ultima = (agora - st.session_state.ultima_cobranca).total_seconds()
+    
+    if agora > data_tarefa and tempo_desde_ultima > 300: # 300 segundos = 5 min
+        mensagem_cobranca = f"Atenção! Já passou das {t['data_hora'].split(' ')[1]} e você não marcou como feita: {t['descricao']}. Vai fazer agora?"
+        st.session_state.ultima_cobranca = agora # Marca que cobrou agora
+        break # Cobra uma por vez pra não virar bagunça
 
-with col1:
-    if audio := st.audio_input("🎙️"):
-        if audio != st.session_state.ultimo_audio:
-            st.session_state.ultimo_audio = audio
-            with st.spinner("Ouvindo..."):
-                if transcricao := ouvir_audio(audio):
-                    texto_input = transcricao
-                    falar_resposta = True
+# Se o vigia detectou atraso, ele TOCA O TERROR (Gera áudio sozinho)
+if mensagem_cobranca:
+    # Adiciona no chat visualmente
+    st.session_state.memoria_v3.append({"role": "assistant", "content": "🔔 " + mensagem_cobranca})
+    
+    # Gera o áudio da bronca
+    arquivo_bronca = asyncio.run(falar(mensagem_cobranca))
+    st.audio(arquivo_bronca, format="audio/mp3", autoplay=True)
+    st.toast("🔔 TAREFA ATRASADA! AUMENTA O SOM!", icon="📢")
 
-# --- PROCESSAMENTO ---
-if texto_input:
-    st.session_state.memoria_v3.append({"role": "user", "content": texto_input})
-    with chat_container.chat_message("user"):
-        st.markdown(texto_input)
 
-    with chat_container.chat_message("assistant"):
-        placeholder = st.empty()
-        dados_web = ""
+# --- EXIBIÇÃO NORMAL ---
+with col_agenda:
+    st.subheader("📌 Agenda")
+    if tarefas:
+        for i, t in enumerate(tarefas):
+            st.warning(f"{t['data_hora']}\n{t['descricao']}")
+            if st.button("✅ Feito", key=i):
+                tarefas.pop(i)
+                salvar_tarefas(tarefas)
+                st.rerun()
+    else: st.info("Livre!")
+
+with col_main:
+    # Chat
+    container = st.container()
+    with container:
+        for m in st.session_state.memoria_v3:
+            with st.chat_message(m["role"]): st.markdown(m["content"])
+
+    # Inputs
+    st.divider()
+    c1, c2 = st.columns([0.15, 0.85])
+    texto = None
+    usou_voz = False
+    
+    with c2: 
+        if t := st.chat_input("Digitar..."): texto = t
+    with c1:
+        if a := st.audio_input("🎙️"):
+            if a != st.session_state.ultimo_audio:
+                st.session_state.ultimo_audio = a
+                with st.spinner("."): 
+                    texto = ouvir_audio(a)
+                    usou_voz = True
+
+    # Processamento
+    if texto:
+        st.session_state.memoria_v3.append({"role": "user", "content": texto})
+        with container.chat_message("user"): st.markdown(texto)
         
-        # Decisão de Busca
-        if modo_internet:
-            with st.status(f"🧠 {nome_ia} está pensando...", expanded=True) as status:
-                if cerebro_decisor(texto_input):
-                    status.write("🌍 Buscando informações...")
-                    raw_data = buscar_tavily(texto_input)
-                    if raw_data:
-                        dados_web = f"\n\n[DADOS DA WEB]:\n{raw_data}\n"
-                        status.update(label="✅ Informação encontrada!", state="complete", expanded=False)
-                    else:
-                        status.update(label="❌ Nada encontrado.", state="error")
-                else:
-                    status.update(label="📚 Memória interna.", state="complete", expanded=False)
+        with container.chat_message("assistant"):
+            intencao = identificar_intencao(texto)
+            resp = ""
+            
+            if "AGENDAR" in intencao:
+                d = extrair_dados_tarefa(texto)
+                if d:
+                    tarefas.append(d)
+                    salvar_tarefas(tarefas)
+                    resp = f"Agendado: {d['descricao']} para {d['data_hora']}."
+                    st.rerun() # Atualiza a agenda na hora
+            
+            elif "BUSCAR" in intencao:
+                if web := buscar_tavily(texto):
+                    resp = client.chat.completions.create(model=MODEL_ID, messages=[{"role":"user","content":f"Dados: {web}. Pergunta: {texto}"}]).choices[0].message.content
+            
+            else:
+                msgs = [{"role":"system","content":"Assistente útil."}] + [{"role":m["role"],"content":str(m["content"])} for m in st.session_state.memoria_v3]
+                resp = client.chat.completions.create(model=MODEL_ID, messages=msgs).choices[0].message.content
 
-        # Prompt com PERSONALIDADE DINÂMICA
-        try:
-            with st.spinner("Digitando..."):
-                # AQUI É O PULO DO GATO: Injetamos o nome e personalidade escolhidos
-                system_instruction = f"""
-                Seu nome é {nome_ia}.
-                Sua personalidade/instruções são: {personalidade}
-                Responda sempre em Português do Brasil.
-                Use os dados da web fornecidos se houver.
-                """
-                
-                msgs = [{"role": "system", "content": system_instruction}]
-                for m in st.session_state.memoria_v3[:-1]:
-                    if m.get("content"): msgs.append({"role": m["role"], "content": str(m["content"])})
-                
-                msgs.append({"role": "user", "content": texto_input + dados_web})
-
-                stream = client.chat.completions.create(model=MODEL_ID, messages=msgs, stream=False)
-                resp = stream.choices[0].message.content
-                placeholder.markdown(resp)
-                
-                if falar_resposta:
-                    audio_file = asyncio.run(falar(resp))
-                    st.audio(audio_file, format="audio/mp3", autoplay=True)
-                
+            if resp:
+                st.markdown(resp)
                 st.session_state.memoria_v3.append({"role": "assistant", "content": resp})
-        
-        except Exception as e:
-            st.error(f"Erro: {e}")
+                if usou_voz:
+                    mp3 = asyncio.run(falar(resp))
+                    st.audio(mp3, format="audio/mp3", autoplay=True)
+
+# --- O CORAÇÃO DO SISTEMA (AUTO-REFRESH) ---
+# Isso faz a página recarregar sozinha a cada 30 segundos para checar tarefas
+time.sleep(30)
+st.rerun()
