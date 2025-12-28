@@ -1,18 +1,19 @@
 import streamlit as st
 from groq import Groq
+from tavily import TavilyClient # O Buscador Profissional
 import edge_tts
 import asyncio
-from duckduckgo_search import DDGS # O Mecanismo de Busca
 
 # --- 1. Configuração ---
-st.set_page_config(page_title="Jarvis Supremo", page_icon="🌐")
-st.title("Assistente Pessoal (Conectado)")
+st.set_page_config(page_title="Jarvis Conectado", page_icon="🌐")
+st.title("Assistente Pessoal (Tavily + Llama)")
 
-# --- 2. Conexão ---
+# --- 2. Conexão e Chaves ---
 try:
     client = Groq(api_key=st.secrets["GROQ_API_KEY"])
+    tavily = TavilyClient(api_key=st.secrets["TAVILY_API_KEY"])
 except Exception as e:
-    st.error("⚠️ Erro na Chave API.")
+    st.error("⚠️ Erro nas Chaves API. Verifique os Secrets (Groq e Tavily).")
     st.stop()
 
 MODEL_ID = "llama-3.3-70b-versatile"
@@ -20,36 +21,35 @@ MODEL_ID = "llama-3.3-70b-versatile"
 # --- 3. Memória ---
 if "memoria_v3" not in st.session_state:
     st.session_state.memoria_v3 = []
-if "ultimo_audio_processado" not in st.session_state:
-    st.session_state.ultimo_audio_processado = None
+if "ultimo_audio" not in st.session_state:
+    st.session_state.ultimo_audio = None
 
-# --- SIDEBAR DE CONTROLE ---
+# --- SIDEBAR ---
 with st.sidebar:
-    st.header("Configurações")
-    # O Interruptor da Internet
-    modo_internet = st.toggle("🌍 Modo Internet", value=False, help="Ative para a IA pesquisar dados atuais na web.")
-    
-    if st.button("🗑️ Limpar Memória"):
+    # Interruptor da Internet (Ligado por padrão para testar)
+    modo_internet = st.toggle("🌍 Acesso à Internet", value=True)
+    if st.button("🗑️ Limpar Tudo"):
         st.session_state.memoria_v3 = []
-        st.session_state.ultimo_audio_processado = None
+        st.session_state.ultimo_audio = None
         st.rerun()
 
 # --- FUNÇÕES ---
-
-def pesquisar_web(termo):
-    """Busca no DuckDuckGo e retorna os primeiros resultados"""
+def buscar_na_web_tavily(pergunta):
+    """Usa a IA da Tavily para ler a internet e resumir a resposta"""
     try:
-        with DDGS() as ddgs:
-            results = list(ddgs.text(termo, max_results=3))
-            if results:
-                # Formata os resultados para a IA ler
-                contexto = "\n".join([f"- {r['title']}: {r['body']}" for r in results])
-                return contexto
+        # search_depth="basic" gasta 1 crédito. "advanced" gasta 2.
+        response = tavily.search(query=pergunta, search_depth="basic", max_results=2)
+        
+        # Monta um resumo do que achou
+        contexto = []
+        for r in response.get('results', []):
+            contexto.append(f"- Fonte: {r['title']}\n  Resumo: {r['content']}")
+        
+        return "\n\n".join(contexto)
     except Exception as e:
-        return None
-    return None
+        return f"Erro na busca: {e}"
 
-def ouvir_audio_whisper(audio_bytes):
+def ouvir_audio(audio_bytes):
     try:
         return client.audio.transcriptions.create(
             file=("temp.wav", audio_bytes, "audio/wav"),
@@ -57,100 +57,82 @@ def ouvir_audio_whisper(audio_bytes):
             response_format="text",
             language="pt"
         )
-    except:
-        return None
+    except: return None
 
-async def gerar_audio_neural(texto):
-    OUTPUT_FILE = "resposta_neural.mp3"
-    VOICE = "pt-BR-FranciscaNeural" 
-    communicate = edge_tts.Communicate(texto, VOICE)
-    await communicate.save(OUTPUT_FILE)
-    return OUTPUT_FILE
+async def falar(texto):
+    OUTPUT = "resposta.mp3"
+    VOICE = "pt-BR-FranciscaNeural"
+    await edge_tts.Communicate(texto, VOICE).save(OUTPUT)
+    return OUTPUT
 
-# --- 4. Interface Visual ---
+# --- 4. Interface ---
 chat_container = st.container()
-
 with chat_container:
-    for message in st.session_state.memoria_v3:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+    for m in st.session_state.memoria_v3:
+        with st.chat_message(m["role"]):
+            st.markdown(m["content"])
 
-# --- 5. Inputs ---
 st.divider()
-col_audio, col_texto = st.columns([0.2, 0.8])
+col1, col2 = st.columns([0.2, 0.8])
 
-prompt_final = None
-vai_responder_com_audio = False 
+texto_input = None
+falar_resposta = False
 
-with col_texto:
-    prompt_texto = st.chat_input("Digite sua mensagem...")
+with col2:
+    if txt := st.chat_input("Mensagem..."):
+        texto_input = txt
 
-with col_audio:
-    audio_gravado = st.audio_input("🎙️")
+with col1:
+    if audio := st.audio_input("🎙️"):
+        if audio != st.session_state.ultimo_audio:
+            st.session_state.ultimo_audio = audio
+            with st.spinner("Ouvindo..."):
+                if transcricao := ouvir_audio(audio):
+                    texto_input = transcricao
+                    falar_resposta = True
 
-# --- 6. Lógica de Decisão ---
-if prompt_texto:
-    prompt_final = prompt_texto
-    vai_responder_com_audio = False
-
-elif audio_gravado:
-    if audio_gravado != st.session_state.ultimo_audio_processado:
-        with st.spinner("Ouvindo..."):
-            texto_transcrito = ouvir_audio_whisper(audio_gravado)
-            if texto_transcrito:
-                prompt_final = texto_transcrito
-                vai_responder_com_audio = True 
-                st.session_state.ultimo_audio_processado = audio_gravado
-
-# --- 7. Processamento e Resposta ---
-if prompt_final:
-    # Mostra mensagem do usuário
-    st.session_state.memoria_v3.append({"role": "user", "content": prompt_final})
+# --- 5. Cérebro ---
+if texto_input:
+    # Mostra User
+    st.session_state.memoria_v3.append({"role": "user", "content": texto_input})
     with chat_container.chat_message("user"):
-        st.markdown(prompt_final)
+        st.markdown(texto_input)
 
-    # Resposta da IA
+    # Gera Resposta
     with chat_container.chat_message("assistant"):
-        placeholder_texto = st.empty()
+        placeholder = st.empty()
         
+        # A. Busca na Web (Se necessário)
+        dados_web = ""
+        if modo_internet:
+            with st.spinner("🌍 Lendo a internet com Tavily..."):
+                # A Tavily é inteligente, ela lê e resume o conteúdo real das páginas
+                resultado_busca = buscar_na_web_tavily(texto_input)
+                if resultado_busca and "Erro" not in resultado_busca:
+                    dados_web = f"\n\n[DADOS ATUALIZADOS DA WEB]:\n{resultado_busca}\nUse esses dados para responder."
+        
+        # B. Prompt Final
+        msgs = [{"role": "system", "content": "Você é uma assistente útil e atualizada. Use os dados da web fornecidos para responder perguntas factuais."}]
+        # Adiciona histórico recente + contexto da web na última mensagem
+        for m in st.session_state.memoria_v3[:-1]: # Histórico anterior
+             if m.get("content"): msgs.append({"role": m["role"], "content": str(m["content"])})
+        
+        # Última mensagem com o "superpoder" da web
+        msgs.append({"role": "user", "content": texto_input + dados_web})
+
+        # C. Chama Llama 3
         try:
-            # A. PESQUISA NA WEB (Se o modo estiver ligado)
-            contexto_extra = ""
-            if modo_internet:
-                with st.spinner("🔍 Pesquisando na web..."):
-                    dados_web = pesquisar_web(prompt_final)
-                    if dados_web:
-                        contexto_extra = f"\n\n[DADOS DA WEB EM TEMPO REAL]:\n{dados_web}\nUse esses dados para responder se for relevante."
-            
-            # B. Prepara Mensagens
-            msgs_api = [{"role": "system", "content": "Você é uma assistente útil e direta. Responda em Português."}]
-            
-            # Injeta o contexto da web na última mensagem
-            msgs_api.append({"role": "user", "content": prompt_final + contexto_extra})
-
-            # Adiciona histórico anterior (opcional, para manter contexto da conversa)
-            # Para economizar tokens na busca, as vezes enviamos só a última com contexto, 
-            # mas vamos manter simples aqui enviando só a atual turbinada.
-            
-            # C. Gera Texto
             with st.spinner("Pensando..."):
-                completion = client.chat.completions.create(
-                    model=MODEL_ID,
-                    messages=msgs_api,
-                    stream=False
-                )
-                resposta_texto = completion.choices[0].message.content
-                placeholder_texto.markdown(resposta_texto)
-
-            # D. Gera Áudio (Se necessário)
-            if vai_responder_com_audio:
-                with st.spinner("Gerando voz..."):
-                    arquivo_audio = asyncio.run(gerar_audio_neural(resposta_texto))
-                    if arquivo_audio:
-                        st.audio(arquivo_audio, format="audio/mp3", autoplay=True)
-
-            # Salva
-            st.session_state.memoria_v3.append({"role": "assistant", "content": resposta_texto})
-
+                stream = client.chat.completions.create(model=MODEL_ID, messages=msgs, stream=False)
+                resp = stream.choices[0].message.content
+                placeholder.markdown(resp)
+                
+                if falar_resposta:
+                    with st.spinner("Falando..."):
+                        audio_file = asyncio.run(falar(resp))
+                        st.audio(audio_file, format="audio/mp3", autoplay=True)
+                
+                st.session_state.memoria_v3.append({"role": "assistant", "content": resp})
+        
         except Exception as e:
             st.error(f"Erro: {e}")
