@@ -1,3 +1,4 @@
 streamlit
 groq
-gtts
+edge-tts
+asyncio
