@@ -6,25 +6,30 @@ st.set_page_config(page_title="Minha Assistente Suprema", page_icon="🧠")
 
 st.title("Assistente Pessoal - Gemma 2")
 
-# Inicializa o cliente Groq usando a chave secreta (vamos configurar isso já já)
-# O Streamlit busca automaticamente em st.secrets["GROQ_API_KEY"]
+# Botão para limpar a memória se der erro
+if st.sidebar.button("🗑️ Limpar Memória"):
+    st.session_state.messages = []
+    st.rerun()
+
+# Inicializa o cliente Groq
 try:
     client = Groq(api_key=st.secrets["GROQ_API_KEY"])
-except:
-    st.error("A chave da API não foi encontrada. Configure os 'Secrets' no Streamlit Cloud.")
+except Exception as e:
+    st.error(f"Erro na chave da API. Verifique os Secrets. Detalhe: {e}")
     st.stop()
 
-# Inicializa o modelo (Gemma 2 9b)
+# Modelo Llama 3.3 (O mais inteligente e grátis)
 MODEL_ID = "llama-3.3-70b-versatile"
 
-# Inicializa o histórico de chat se não existir
+# Inicializa o histórico de chat
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
 # Mostra as mensagens antigas na tela
 for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+    if message["content"]: # Só mostra se tiver conteúdo
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
 
 # Caixa de entrada do usuário
 if prompt := st.chat_input("No que posso ajudar hoje, Christian?"):
@@ -32,20 +37,29 @@ if prompt := st.chat_input("No que posso ajudar hoje, Christian?"):
     st.chat_message("user").markdown(prompt)
     st.session_state.messages.append({"role": "user", "content": prompt})
 
-    # 2. Chama a IA para responder
+    # 2. Prepara o histórico BLINDADO (Remove mensagens vazias ou com erro)
+    safe_history = [
+        {"role": m["role"], "content": str(m["content"])} 
+        for m in st.session_state.messages 
+        if m["content"] is not None
+    ]
+
+    # 3. Chama a IA para responder
     with st.chat_message("assistant"):
-        stream = client.chat.completions.create(
-            model=MODEL_ID,
-            messages=[
-                {"role": "system", "content": "Você é uma assistente pessoal suprema, inteligente e útil. Seu nome é Gemma. Responda sempre em Português do Brasil."},
-                *st.session_state.messages # Passa todo o histórico para ela ter memória curta
-            ],
-            stream=True,
-        )
-        response = st.write_stream(stream)
-    
-    # 3. Salva a resposta da IA no histórico
-    st.session_state.messages.append({"role": "assistant", "content": response})
-
-
-# Atualizando servidor
+        try:
+            stream = client.chat.completions.create(
+                model=MODEL_ID,
+                messages=[
+                    {"role": "system", "content": "Você é uma assistente pessoal suprema, inteligente e útil. Seu nome é Gemma. Responda sempre em Português do Brasil."},
+                    *safe_history
+                ],
+                stream=True,
+            )
+            response = st.write_stream(stream)
+            
+            # Só salva se a resposta for válida
+            if response:
+                st.session_state.messages.append({"role": "assistant", "content": response})
+                
+        except Exception as e:
+            st.error(f"Erro ao gerar resposta: {e}")
