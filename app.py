@@ -15,6 +15,7 @@ import time
 import sqlite3
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from typing import Optional, List, Dict, Any, Tuple
 
 
 # =========================
@@ -29,13 +30,13 @@ FUSO_BR = ZoneInfo("America/Sao_Paulo")
 DB_PATH = "jarvis_memory.db"
 SUMMARY_PATH = "summary.txt"
 
-# lembretes: 0 = no horário / assim que vence, depois 10, 30, 120 min
+# lembretes: 0 = no horário/assim que vence, depois 10, 30, 120 min
 REMINDER_SCHEDULE_MIN = [0, 10, 30, 120]
 
 QUIET_START = 22
 QUIET_END = 7
 
-AUTO_REFRESH_MS = 5_000  # 5s (mais “vivo”)
+AUTO_REFRESH_MS = 5_000  # 5s
 
 
 # =========================
@@ -49,9 +50,6 @@ except Exception:
     st.stop()
 
 
-st.title("Assistente Pessoal")
-
-
 # =========================
 # SESSION STATE
 # =========================
@@ -61,8 +59,9 @@ if "memoria" not in st.session_state:
 if "ultimo_audio_hash" not in st.session_state:
     st.session_state.ultimo_audio_hash = None
 
-if "last_alert_sig" not in st.session_state:
-    st.session_state.last_alert_sig = None
+if "last_alert_fingerprint" not in st.session_state:
+    # fingerprint do último alerta proativo disparado (task_id + next_remind_at)
+    st.session_state.last_alert_fingerprint = None
 
 if "last_input_sig" not in st.session_state:
     st.session_state.last_input_sig = None
@@ -70,16 +69,8 @@ if "last_input_sig" not in st.session_state:
 if "last_input_time" not in st.session_state:
     st.session_state.last_input_time = 0.0
 
-# áudio persistente (opcional)
 if "last_audio_bytes" not in st.session_state:
     st.session_state.last_audio_bytes = None
-
-# controle simples: evitar “martelar” alerta toda vez que o refresh roda
-if "last_alert_task_id" not in st.session_state:
-    st.session_state.last_alert_task_id = None
-
-if "last_alert_at" not in st.session_state:
-    st.session_state.last_alert_at = None  # string format_dt
 
 
 # =========================
@@ -88,11 +79,14 @@ if "last_alert_at" not in st.session_state:
 def now_br() -> datetime:
     return datetime.now(FUSO_BR)
 
+def now_floor_minute() -> datetime:
+    a = now_br()
+    return a.replace(second=0, microsecond=0)
+
 def format_dt(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%d %H:%M")
 
 def parse_dt(s: str) -> datetime:
-    # garante tzinfo
     return datetime.strptime(s, "%Y-%m-%d %H:%M").replace(tzinfo=FUSO_BR)
 
 def em_horario_silencioso(agora: datetime) -> bool:
@@ -104,19 +98,23 @@ def em_horario_silencioso(agora: datetime) -> bool:
 # NOTIFICAÇÃO DO NAVEGADOR (JS)
 # =========================
 def request_notification_permission():
+    # IMPORTANTE: browsers exigem gesto do usuário (clique) pra permitir.
     components.html(
         """
         <script>
-        if ('Notification' in window) {
-          Notification.requestPermission();
-        }
+        (async function(){
+          try {
+            if (!('Notification' in window)) return;
+            await Notification.requestPermission();
+          } catch(e) {}
+        })();
         </script>
         """,
         height=0,
     )
 
 def browser_notify(title: str, body: str):
-    # Notificação + beep (o beep pode ser bloqueado por autoplay em alguns navegadores)
+    # Notificação + beep curto (pode ser bloqueado por autoplay em alguns navegadores)
     payload_title = json.dumps(title)
     payload_body = json.dumps(body)
     components.html(
@@ -124,14 +122,12 @@ def browser_notify(title: str, body: str):
         <script>
         (function() {{
           try {{
-            if ('Notification' in window) {{
-              if (Notification.permission === 'granted') {{
-                new Notification({payload_title}, {{ body: {payload_body} }});
-              }}
+            if ('Notification' in window && Notification.permission === 'granted') {{
+              new Notification({payload_title}, {{ body: {payload_body} }});
             }}
           }} catch(e) {{}}
 
-          // beep curto (pode falhar sem gesto do usuário)
+          // Beep (WebAudio) - pode falhar se o browser bloquear audio sem gesto
           try {{
             const AudioContext = window.AudioContext || window.webkitAudioContext;
             if (AudioContext) {{
@@ -141,12 +137,13 @@ def browser_notify(title: str, body: str):
               o.type = 'sine';
               o.frequency.value = 880;
               g.gain.value = 0.05;
-              o.connect(g); g.connect(ctx.destination);
+              o.connect(g);
+              g.connect(ctx.destination);
               o.start();
               setTimeout(() => {{
                 o.stop();
                 ctx.close();
-              }}, 220);
+              }}, 200);
             }}
           }} catch(e) {{}}
         }})();
@@ -187,7 +184,6 @@ def init_db():
         """)
     except Exception:
         pass
-
     conn.commit()
     conn.close()
 
@@ -306,7 +302,6 @@ def carregar_tarefas() -> list:
         return []
 
 def salvar_tarefas(lista: list) -> None:
-    # gravação mais segura (evita corromper se travar no meio)
     tmp = ARQUIVO_TAREFAS + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(lista, f, ensure_ascii=False, indent=2)
@@ -319,15 +314,15 @@ def limpar_texto(s: str) -> str:
     return s
 
 def normalizar_tarefa(d: dict) -> dict:
-    agora = now_br()
+    agora = now_floor_minute()
     d = dict(d)
     d.setdefault("id", str(uuid.uuid4())[:8])
     d.setdefault("status", "ativa")  # ativa | silenciada
-    d.setdefault("remind_count", 0)  # quantos lembretes já foram disparados
+    d.setdefault("remind_count", 0)
     d.setdefault("last_reminded_at", None)
     d.setdefault("snoozed_until", None)
     d.setdefault("created_at", format_dt(agora))
-    d.setdefault("next_remind_at", d.get("data_hora"))  # primeira vez: no horário exato
+    d.setdefault("next_remind_at", d.get("data_hora"))  # primeira vez: no horário
     return d
 
 
@@ -366,7 +361,6 @@ def parse_relativo(texto: str):
     return timedelta(minutes=n)
 
 def ajustar_para_futuro(dt_extraido: datetime, agora: datetime) -> datetime:
-    # se caiu no passado, empurra pro próximo horário plausível
     if dt_extraido >= agora:
         return dt_extraido
     tentativa = dt_extraido + timedelta(hours=12)
@@ -383,7 +377,7 @@ def extrair_descricao(texto: str) -> str:
     return t if t else "tarefa"
 
 def extrair_dados_tarefa(texto: str):
-    agora = now_br()
+    agora = now_floor_minute()
 
     delta = parse_relativo(texto)
     if delta:
@@ -447,7 +441,7 @@ def parece_pergunta_factual(texto: str) -> bool:
     return False
 
 def router_llm(texto: str, tarefas: list) -> dict:
-    agora = format_dt(now_br())
+    agora = format_dt(now_floor_minute())
     resumo = "\n".join([f"- {i}: {t.get('descricao','')} @ {t.get('data_hora','')}" for i, t in enumerate(tarefas)]) or "(vazio)"
 
     prompt = f"""
@@ -473,8 +467,7 @@ Responda APENAS JSON:
   "action":"TASK_CREATE|TASK_DONE|TASK_SNOOZE|TASK_SILENCE|WEB_SEARCH|CHAT",
   "task_index":-1,
   "minutes":0,
-  "search_query":"",
-  "confidence":0.0
+  "search_query":""
 }}
 """.strip()
 
@@ -492,25 +485,24 @@ Responda APENAS JSON:
             "task_index": int(data.get("task_index", -1) or -1),
             "minutes": int(data.get("minutes", 0) or 0),
             "search_query": data.get("search_query", "") or "",
-            "confidence": float(data.get("confidence", 0.0) or 0.0),
         }
     except Exception:
-        return {"action": "CHAT", "task_index": -1, "minutes": 0, "search_query": "", "confidence": 0.0}
+        return {"action": "CHAT", "task_index": -1, "minutes": 0, "search_query": ""}
 
 def decidir_acao(texto: str, tarefas: list) -> dict:
     t = limpar_texto(texto)
 
     if t.startswith("/web "):
-        return {"action": "WEB_SEARCH", "search_query": str(texto)[5:].strip(), "task_index": -1, "minutes": 0, "confidence": 1.0}
+        return {"action": "WEB_SEARCH", "search_query": str(texto)[5:].strip(), "task_index": -1, "minutes": 0}
     if t.startswith("/chat "):
-        return {"action": "CHAT", "search_query": "", "task_index": -1, "minutes": 0, "confidence": 1.0}
+        return {"action": "CHAT", "search_query": "", "task_index": -1, "minutes": 0}
     if t.startswith("/resumo"):
-        return {"action": "SHOW_SUMMARY", "search_query": "", "task_index": -1, "minutes": 0, "confidence": 1.0}
+        return {"action": "SHOW_SUMMARY", "search_query": "", "task_index": -1, "minutes": 0}
     if t.startswith("/memoria "):
-        return {"action": "SHOW_MEMORY", "search_query": str(texto)[9:].strip(), "task_index": -1, "minutes": 0, "confidence": 1.0}
+        return {"action": "SHOW_MEMORY", "search_query": str(texto)[9:].strip(), "task_index": -1, "minutes": 0}
 
     if re.search(r"^(me\s+lembra|lembra\s+de|me\s+avisa|avisa\s+me|me\s+cobra)", t):
-        return {"action": "TASK_CREATE", "search_query": "", "task_index": -1, "minutes": 0, "confidence": 1.0}
+        return {"action": "TASK_CREATE", "search_query": "", "task_index": -1, "minutes": 0}
 
     if any(x in t for x in ["adiar", "mais tarde", "snooze", "me lembra em", "daqui a"]):
         mins = 30
@@ -519,18 +511,18 @@ def decidir_acao(texto: str, tarefas: list) -> dict:
             mins = int(mm.group(1))
             if "h" in mm.group(2) or "hora" in mm.group(2):
                 mins *= 60
-        return {"action": "TASK_SNOOZE", "search_query": "", "task_index": -1, "minutes": mins, "confidence": 0.95}
+        return {"action": "TASK_SNOOZE", "search_query": "", "task_index": -1, "minutes": mins}
 
     done_terms = ["já fiz", "ja fiz", "feito", "terminei", "conclui", "finalizei", "resolvi"]
     if any(x in t for x in done_terms):
-        return {"action": "TASK_DONE", "search_query": "", "task_index": -1, "minutes": 0, "confidence": 0.95}
+        return {"action": "TASK_DONE", "search_query": "", "task_index": -1, "minutes": 0}
 
     silence_terms = ["desconsidera", "cancela", "cancelar", "para de lembrar", "pare de lembrar", "não me lembra", "nao me lembra", "silencia"]
     if any(x in t for x in silence_terms):
-        return {"action": "TASK_SILENCE", "search_query": "", "task_index": -1, "minutes": 0, "confidence": 0.9}
+        return {"action": "TASK_SILENCE", "search_query": "", "task_index": -1, "minutes": 0}
 
     if parece_pergunta_factual(texto):
-        return {"action": "WEB_SEARCH", "search_query": str(texto).strip(), "task_index": -1, "minutes": 0, "confidence": 0.85}
+        return {"action": "WEB_SEARCH", "search_query": str(texto).strip(), "task_index": -1, "minutes": 0}
 
     return router_llm(texto, tarefas)
 
@@ -544,7 +536,7 @@ def escolher_tarefa(texto_usuario: str, tarefas: list) -> int:
     if len(tarefas) == 1:
         return 0
 
-    agora = now_br()
+    agora = now_floor_minute()
     atrasadas = []
     for i, t in enumerate(tarefas):
         try:
@@ -557,7 +549,6 @@ def escolher_tarefa(texto_usuario: str, tarefas: list) -> int:
     if len(atrasadas) == 1:
         return atrasadas[0]
 
-    texto = limpar_texto(texto_usuario)
     linhas = [f"ID {i}: {t.get('descricao','')} @ {t.get('data_hora','')}" for i, t in enumerate(tarefas)]
     prompt = (
         "Lista de tarefas:\n" + "\n".join(linhas) + "\n\n"
@@ -578,7 +569,7 @@ def escolher_tarefa(texto_usuario: str, tarefas: list) -> int:
 
 
 # =========================
-# WEB / AUDIO
+# WEB / ÁUDIO
 # =========================
 def buscar_tavily(q: str):
     try:
@@ -613,7 +604,6 @@ async def falar_async(texto: str, out_path: str):
     return out_path
 
 def falar_bytes(texto: str):
-    """Gera MP3 e retorna bytes (sem pausar refresh; notificação principal é via navegador)."""
     try:
         out_path = f"tts_{uuid.uuid4().hex[:10]}.mp3"
         try:
@@ -656,14 +646,13 @@ def build_chat_messages(user_text: str):
 
 
 # =========================
-# VIGIA: ALERTA NO HORÁRIO (CORRIGIDO)
+# VIGIA PROATIVO (ROBUSTO)
 # =========================
-def compute_next_remind_at(agora: datetime, t: dict) -> datetime | None:
-    """Decide quando deve ser o próximo lembrete, respeitando snooze e agenda."""
+def compute_next_remind_at(agora: datetime, t: dict) -> Optional[datetime]:
     if t.get("status") == "silenciada":
         return None
 
-    # snooze tem prioridade (se futuro)
+    # Snooze tem prioridade se estiver no futuro
     if t.get("snoozed_until"):
         try:
             su = parse_dt(t["snoozed_until"])
@@ -672,7 +661,7 @@ def compute_next_remind_at(agora: datetime, t: dict) -> datetime | None:
         except Exception:
             pass
 
-    # caso normal: next_remind_at (se existir), senão data_hora
+    # Caso normal: next_remind_at ou data_hora
     try:
         nr = parse_dt(t.get("next_remind_at") or t["data_hora"])
         return nr
@@ -680,27 +669,24 @@ def compute_next_remind_at(agora: datetime, t: dict) -> datetime | None:
         return None
 
 def schedule_after_fire(agora: datetime, t: dict) -> dict:
-    """Atualiza tarefa depois de disparar um lembrete."""
     t = dict(t)
     t["last_reminded_at"] = format_dt(agora)
     t["remind_count"] = int(t.get("remind_count", 0) or 0) + 1
-
-    # limpa snooze após disparar (senão fica prendendo)
     t["snoozed_until"] = None
 
-    # decide próximo
     if t["remind_count"] >= len(REMINDER_SCHEDULE_MIN):
-        # acabou sequência -> silencia
         t["status"] = "silenciada"
         t["next_remind_at"] = format_dt(agora + timedelta(days=365))
     else:
-        mins = REMINDER_SCHEDULE_MIN[t["remind_count"]]  # 1->10, 2->30, 3->120
+        mins = REMINDER_SCHEDULE_MIN[t["remind_count"]]
         t["next_remind_at"] = format_dt(agora + timedelta(minutes=mins))
     return t
 
-def pick_due_task(tarefas: list, agora: datetime):
-    """Escolhe 1 tarefa pra alertar (a mais “urgente”)."""
-    candidates = []
+def pick_due_task(tarefas: list, agora: datetime) -> Optional[dict]:
+    if em_horario_silencioso(agora):
+        return None
+
+    candidates: List[Tuple[float, dict]] = []
     for t in tarefas:
         if t.get("status") == "silenciada":
             continue
@@ -709,52 +695,53 @@ def pick_due_task(tarefas: list, agora: datetime):
         except Exception:
             continue
 
-        # IMPORTANTÍSSIMO: agora >= data_hora (não mais >)
+        # Dispara no horário: agora >= due
         if agora < due:
-            continue
-
-        # quiet hours: não alerta agora
-        if em_horario_silencioso(agora):
             continue
 
         nr = compute_next_remind_at(agora, t)
         if nr is None:
             continue
         if agora >= nr:
-            # mais atrasada primeiro
             atraso_min = (agora - due).total_seconds() / 60.0
             candidates.append((atraso_min, t))
+
     if not candidates:
         return None
+
     candidates.sort(key=lambda x: x[0], reverse=True)
     return candidates[0][1]
 
 
 # =========================
-# LOAD + AUTORREFRESH (sempre)
+# AUTOREFRESH (sempre no topo)
 # =========================
-st_autorefresh(interval=AUTO_REFRESH_MS, key="auto_refresh")
+st_autorefresh(interval=AUTO_REFRESH_MS, key="tick")
 
+
+# =========================
+# LOAD TAREFAS
+# =========================
+agora = now_floor_minute()
 tarefas = [normalizar_tarefa(t) for t in carregar_tarefas()]
 salvar_tarefas(tarefas)
 
-agora = now_br()
 
 # =========================
-# SIDEBAR: AGENDA + NOTIF
+# SIDEBAR SIMPLES
 # =========================
 with st.sidebar:
     st.header("Agenda")
-
     st.caption(f"Agora: {agora.strftime('%H:%M:%S')} (BR)")
+    st.caption(f"Auto-refresh: {AUTO_REFRESH_MS/1000:.0f}s")
 
-    colA, colB = st.columns(2)
-    with colA:
+    cA, cB = st.columns(2)
+    with cA:
         if st.button("Ativar notificações"):
             request_notification_permission()
-            st.success("Pedido de permissão enviado. Se o navegador perguntar, clique em Permitir.")
-    with colB:
-        if st.button("Mostrar resumo"):
+            st.success("Se o navegador perguntar, clique em **Permitir**.")
+    with cB:
+        if st.button("Resumo"):
             st.info(load_summary())
 
     st.divider()
@@ -762,16 +749,13 @@ with st.sidebar:
     if not tarefas:
         st.success("Livre!")
     else:
-        # ordena por horário
         def sort_key(x):
             try:
                 return parse_dt(x["data_hora"])
             except Exception:
                 return datetime.max.replace(tzinfo=FUSO_BR)
 
-        tarefas_sorted = sorted(tarefas, key=sort_key)
-
-        for t in tarefas_sorted:
+        for t in sorted(tarefas, key=sort_key):
             try:
                 dt = parse_dt(t["data_hora"])
                 atrasada = agora >= dt
@@ -779,23 +763,23 @@ with st.sidebar:
                 atrasada = False
 
             status = t.get("status", "ativa")
-            badge = "✅" if status == "silenciada" else ("🔥" if atrasada else "📌")
+            badge = "🔕" if status == "silenciada" else ("🔥" if atrasada else "📌")
             st.write(f"{badge} **{t.get('data_hora','??:??').split(' ')[1]}** — {t.get('descricao','(sem descrição)')}")
 
-            c1, c2 = st.columns(2)
-            with c1:
+            b1, b2 = st.columns(2)
+            with b1:
                 if st.button("Feito", key=f"feito_{t['id']}"):
-                    tarefas = [x for x in tarefas if x.get("id") != t.get("id")]
-                    salvar_tarefas(tarefas)
+                    tarefas2 = [x for x in tarefas if x.get("id") != t.get("id")]
+                    salvar_tarefas(tarefas2)
                     add_event("task", f"CONCLUÍDA (botão): {t['descricao']}", meta=json.dumps(t, ensure_ascii=False))
                     update_summary_with_llm(f"Tarefa concluída: {t['descricao']}")
                     st.rerun()
-            with c2:
+            with b2:
                 if st.button("Silenciar", key=f"sil_{t['id']}"):
                     for x in tarefas:
                         if x.get("id") == t.get("id"):
                             x["status"] = "silenciada"
-                            x["next_remind_at"] = format_dt(now_br() + timedelta(days=365))
+                            x["next_remind_at"] = format_dt(now_floor_minute() + timedelta(days=365))
                     salvar_tarefas(tarefas)
                     add_event("task", f"SILENCIADA (botão): {t['descricao']}", meta=json.dumps(t, ensure_ascii=False))
                     st.rerun()
@@ -803,66 +787,65 @@ with st.sidebar:
     with st.expander("Debug", expanded=False):
         if st.button("Últimos 20 eventos"):
             evs = get_last_events(20)
-            st.write([{"ts": a, "kind": b, "content": c[:120]} for a, b, c in evs])
+            st.write([{"ts": a, "kind": b, "content": c[:140]} for a, b, c in evs])
         if st.button("Limpar áudio"):
             st.session_state.last_audio_bytes = None
             st.rerun()
 
 
 # =========================
-# ALERTA PROATIVO (SEMPRE RODANDO)
+# ALERTA PROATIVO (SEM PRECISAR MENSAGEM)
 # =========================
 mensagem_alerta = None
 tarefa_alertada = pick_due_task(tarefas, agora)
 
 if tarefa_alertada:
-    tarefa_id = tarefa_alertada["id"]
-    sig = f"{tarefa_id}:{format_dt(agora)}"
+    # fingerprint baseado no próximo lembrete (não no "minuto atual")
+    # assim não duplica e não depende do clock do refresh
+    next_at_str = tarefa_alertada.get("next_remind_at") or tarefa_alertada.get("data_hora")
+    fingerprint = f"{tarefa_alertada['id']}::{next_at_str}"
 
-    # evita repetir a mesma coisa a cada refresh do mesmo minuto
-    if st.session_state.last_alert_task_id == tarefa_id and st.session_state.last_alert_at == format_dt(agora):
-        pass
-    else:
-        st.session_state.last_alert_task_id = tarefa_id
-        st.session_state.last_alert_at = format_dt(agora)
+    if st.session_state.last_alert_fingerprint != fingerprint:
+        st.session_state.last_alert_fingerprint = fingerprint
 
         mensagem_alerta = (
             f"🔔 **Lembrete:** {tarefa_alertada['descricao']}\n\n"
             f"Horário: **{tarefa_alertada['data_hora']}**\n\n"
-            "Responda: **feito**, **adiar 30 min**, **silenciar**."
+            "Você pode responder: **feito**, **adiar 30 min**, **silenciar**."
         )
 
-        # notificação do navegador (se tiver permissão)
+        # tenta notificação do navegador
         browser_notify("Lembrete", tarefa_alertada["descricao"])
+
+        # também tenta TTS curto (fica dentro da página)
+        b = falar_bytes("Ei! Você tem um lembrete.")
+        if b:
+            st.session_state.last_audio_bytes = b
 
         # atualiza tarefa (agenda próximo lembrete)
         updated = schedule_after_fire(agora, tarefa_alertada)
         tarefas2 = []
         for x in tarefas:
-            if x.get("id") == tarefa_id:
-                tarefas2.append(updated)
-            else:
-                tarefas2.append(x)
+            tarefas2.append(updated if x.get("id") == tarefa_alertada["id"] else x)
         tarefas = tarefas2
         salvar_tarefas(tarefas)
+
         add_event("task", f"LEMBRETE: {tarefa_alertada['descricao']}", meta=json.dumps(updated, ensure_ascii=False))
 
 
 # =========================
-# UI PRINCIPAL
+# UI PRINCIPAL (SIMPLES)
 # =========================
+st.title("Assistente Pessoal")
+
+if em_horario_silencioso(agora):
+    st.info("Modo silencioso ativo (sem alertas) — entre 22:00 e 07:00.")
+
 if mensagem_alerta:
     st.warning(mensagem_alerta)
-    # também joga no chat uma única vez por alerta
-    alert_sig = f"{tarefa_alertada['id']}:{tarefa_alertada.get('last_reminded_at','')}"
-    if st.session_state.last_alert_sig != alert_sig:
-        st.session_state.last_alert_sig = alert_sig
-        st.session_state.memoria.append({"role": "assistant", "content": mensagem_alerta})
-
-        # TTS opcional curto (pode comentar se não quiser)
-        b = falar_bytes("Ei! Lembrete de tarefa.")
-        if b:
-            st.session_state.last_audio_bytes = b
+    st.toast(f"Lembrete: {tarefa_alertada['descricao']}", icon="🔔")
+    # joga no chat também (uma vez por fingerprint)
+    st.session_state.memoria.append({"role": "assistant", "content": mensagem_alerta})
 
 if st.session_state.last_audio_bytes:
     st.audio(st.session_state.last_audio_bytes, format="audio/mp3")
@@ -873,6 +856,7 @@ for m in st.session_state.memoria:
         st.markdown(m["content"])
 
 st.divider()
+
 
 # =========================
 # INPUT (texto + voz)
@@ -908,171 +892,161 @@ if texto and should_process_input(str(texto)):
     st.session_state.memoria.append({"role": "user", "content": user_text})
     add_event("chat_user", user_text)
 
-    with st.chat_message("assistant"):
-        tarefas = [normalizar_tarefa(t) for t in carregar_tarefas()]
-        salvar_tarefas(tarefas)
+    tarefas = [normalizar_tarefa(t) for t in carregar_tarefas()]
+    salvar_tarefas(tarefas)
 
-        acao = decidir_acao(user_text, tarefas)
+    acao = decidir_acao(user_text, tarefas)
 
-        if acao["action"] == "SHOW_SUMMARY":
-            resumo = load_summary()
-            st.markdown(resumo)
-            st.session_state.memoria.append({"role": "assistant", "content": resumo})
-            add_event("chat_assistant", resumo)
-            st.stop()
+    # DEBUG
+    if acao["action"] == "SHOW_SUMMARY":
+        resumo = load_summary()
+        st.session_state.memoria.append({"role": "assistant", "content": resumo})
+        add_event("chat_assistant", resumo)
+        st.rerun()
 
-        if acao["action"] == "SHOW_MEMORY":
-            q = (acao.get("search_query") or "").strip()
-            rows = search_memories(q, limit=10)
-            if not rows:
-                out = "Não encontrei memórias relevantes pra isso."
-            else:
-                out = "### Memórias encontradas:\n" + "\n".join([f"- **{ts}** ({kind}) — {c[:220]}" for ts, kind, c in rows])
-            st.markdown(out)
-            st.session_state.memoria.append({"role": "assistant", "content": out})
-            add_event("chat_assistant", out)
-            st.stop()
+    if acao["action"] == "SHOW_MEMORY":
+        q = (acao.get("search_query") or "").strip()
+        rows = search_memories(q, limit=10)
+        if not rows:
+            out = "Não encontrei memórias relevantes pra isso."
+        else:
+            out = "### Memórias encontradas:\n" + "\n".join([f"- **{ts}** ({kind}) — {c[:220]}" for ts, kind, c in rows])
+        st.session_state.memoria.append({"role": "assistant", "content": out})
+        add_event("chat_assistant", out)
+        st.rerun()
 
-        # TASK_CREATE
-        if acao["action"] == "TASK_CREATE":
-            d = extrair_dados_tarefa(user_text)
-            if d:
-                d = normalizar_tarefa(d)
-                d["next_remind_at"] = d["data_hora"]  # garante lembrete NO HORÁRIO
-                tarefas.append(d)
-                salvar_tarefas(tarefas)
+    # TASK_CREATE
+    if acao["action"] == "TASK_CREATE":
+        d = extrair_dados_tarefa(user_text)
+        if d:
+            d = normalizar_tarefa(d)
+            d["next_remind_at"] = d["data_hora"]  # garante lembrete NO HORÁRIO
+            tarefas.append(d)
+            salvar_tarefas(tarefas)
 
-                msg = f"📌 Agendado: **{d['descricao']}** às **{d['data_hora'].split(' ')[1]}**."
-                st.success(msg)
+            msg = f"📌 Agendado: **{d['descricao']}** às **{d['data_hora'].split(' ')[1]}**."
+            st.session_state.memoria.append({"role": "assistant", "content": msg})
+
+            add_event("task", f"CRIADA: {d['descricao']} @ {d['data_hora']}", meta=json.dumps(d, ensure_ascii=False))
+            update_summary_with_llm(f"Nova tarefa agendada: {d['descricao']} às {d['data_hora']}.")
+
+            if usou_voz:
+                b = falar_bytes("Agendado.")
+                if b:
+                    st.session_state.last_audio_bytes = b
+
+            st.rerun()
+        else:
+            msg = "Não consegui entender o horário. Ex: “me lembra de X às 19:19” ou “daqui 10 min”."
+            st.session_state.memoria.append({"role": "assistant", "content": msg})
+            add_event("chat_assistant", msg)
+            st.rerun()
+
+    # TASK_DONE / TASK_SILENCE / TASK_SNOOZE
+    elif acao["action"] in ["TASK_DONE", "TASK_SILENCE", "TASK_SNOOZE"]:
+        if not tarefas:
+            msg = "Sua agenda já está vazia!"
+            st.session_state.memoria.append({"role": "assistant", "content": msg})
+            add_event("chat_assistant", msg)
+            st.rerun()
+        else:
+            idx = escolher_tarefa(user_text, tarefas)
+            if idx == -1 and isinstance(acao.get("task_index", None), int):
+                if 0 <= acao["task_index"] < len(tarefas):
+                    idx = acao["task_index"]
+
+            if idx == -1 or idx >= len(tarefas):
+                msg = "Não consegui identificar qual tarefa você quis afetar."
                 st.session_state.memoria.append({"role": "assistant", "content": msg})
-
-                add_event("task", f"CRIADA: {d['descricao']} @ {d['data_hora']}", meta=json.dumps(d, ensure_ascii=False))
-                update_summary_with_llm(f"Nova tarefa agendada: {d['descricao']} às {d['data_hora']}.")
-
-                if usou_voz:
-                    b = falar_bytes("Agendado.")
-                    if b:
-                        st.audio(b, format="audio/mp3", autoplay=True)
-
+                add_event("chat_assistant", msg)
                 st.rerun()
             else:
-                msg = "Não consegui entender o horário. Ex: “me lembra de X às 19:19” ou “daqui 10 min”."
-                st.warning(msg)
-                st.session_state.memoria.append({"role": "assistant", "content": msg})
-                add_event("chat_assistant", msg)
-
-        # TASK_DONE / TASK_SILENCE / TASK_SNOOZE
-        elif acao["action"] in ["TASK_DONE", "TASK_SILENCE", "TASK_SNOOZE"]:
-            if not tarefas:
-                msg = "Sua agenda já está vazia!"
-                st.info(msg)
-                st.session_state.memoria.append({"role": "assistant", "content": msg})
-                add_event("chat_assistant", msg)
-            else:
-                idx = escolher_tarefa(user_text, tarefas)
-                if idx == -1 and isinstance(acao.get("task_index", None), int):
-                    if 0 <= acao["task_index"] < len(tarefas):
-                        idx = acao["task_index"]
-
-                if idx == -1 or idx >= len(tarefas):
-                    msg = "Não consegui identificar qual tarefa você quis afetar."
-                    st.warning(msg)
+                if acao["action"] == "TASK_DONE":
+                    removida = tarefas.pop(idx)
+                    salvar_tarefas(tarefas)
+                    msg = f"✅ Marquei como feito: **{removida['descricao']}**."
                     st.session_state.memoria.append({"role": "assistant", "content": msg})
-                    add_event("chat_assistant", msg)
-                else:
-                    if acao["action"] == "TASK_DONE":
-                        removida = tarefas.pop(idx)
-                        salvar_tarefas(tarefas)
-                        msg = f"✅ Marquei como feito: **{removida['descricao']}**."
-                        st.success(msg)
-                        st.session_state.memoria.append({"role": "assistant", "content": msg})
+                    add_event("task", f"CONCLUÍDA: {removida['descricao']}", meta=json.dumps(removida, ensure_ascii=False))
+                    update_summary_with_llm(f"Tarefa concluída: {removida['descricao']}.")
+                    st.rerun()
 
-                        add_event("task", f"CONCLUÍDA: {removida['descricao']}", meta=json.dumps(removida, ensure_ascii=False))
-                        update_summary_with_llm(f"Tarefa concluída: {removida['descricao']}.")
+                elif acao["action"] == "TASK_SILENCE":
+                    agora2 = now_floor_minute()
+                    tarefas[idx]["status"] = "silenciada"
+                    tarefas[idx]["next_remind_at"] = format_dt(agora2 + timedelta(days=365))
+                    salvar_tarefas(tarefas)
+                    msg = f"🔕 Parei de te lembrar: **{tarefas[idx]['descricao']}**."
+                    st.session_state.memoria.append({"role": "assistant", "content": msg})
+                    add_event("task", f"SILENCIADA: {tarefas[idx]['descricao']}", meta=json.dumps(tarefas[idx], ensure_ascii=False))
+                    st.rerun()
 
-                        st.rerun()
+                elif acao["action"] == "TASK_SNOOZE":
+                    mins = int(acao.get("minutes", 30) or 30)
+                    mins = max(1, min(mins, 24 * 60))
+                    agora2 = now_floor_minute()
+                    snooze_until = agora2 + timedelta(minutes=mins)
+                    tarefas[idx]["snoozed_until"] = format_dt(snooze_until)
+                    tarefas[idx]["next_remind_at"] = tarefas[idx]["snoozed_until"]
+                    salvar_tarefas(tarefas)
 
-                    elif acao["action"] == "TASK_SILENCE":
-                        agora2 = now_br()
-                        tarefas[idx]["status"] = "silenciada"
-                        tarefas[idx]["next_remind_at"] = format_dt(agora2 + timedelta(days=365))
-                        salvar_tarefas(tarefas)
-                        msg = f"🔕 Parei de te lembrar: **{tarefas[idx]['descricao']}**."
-                        st.success(msg)
-                        st.session_state.memoria.append({"role": "assistant", "content": msg})
+                    msg = f"⏳ Adiei por {mins} min: **{tarefas[idx]['descricao']}**."
+                    st.session_state.memoria.append({"role": "assistant", "content": msg})
+                    add_event("task", f"ADIADA {mins}min: {tarefas[idx]['descricao']}", meta=json.dumps(tarefas[idx], ensure_ascii=False))
+                    st.rerun()
 
-                        add_event("task", f"SILENCIADA: {tarefas[idx]['descricao']}", meta=json.dumps(tarefas[idx], ensure_ascii=False))
-                        st.rerun()
+    # WEB_SEARCH
+    elif acao["action"] == "WEB_SEARCH":
+        q = (acao.get("search_query") or user_text).strip()
+        web = buscar_tavily(q)
 
-                    elif acao["action"] == "TASK_SNOOZE":
-                        mins = int(acao.get("minutes", 30) or 30)
-                        mins = max(1, min(mins, 24 * 60))
-                        agora2 = now_br()
-                        snooze_until = agora2 + timedelta(minutes=mins)
-                        tarefas[idx]["snoozed_until"] = format_dt(snooze_until)
-                        tarefas[idx]["next_remind_at"] = tarefas[idx]["snoozed_until"]  # garante que vai lembrar no snooze
-                        salvar_tarefas(tarefas)
-
-                        msg = f"⏳ Adiei por {mins} min: **{tarefas[idx]['descricao']}**."
-                        st.success(msg)
-                        st.session_state.memoria.append({"role": "assistant", "content": msg})
-
-                        add_event("task", f"ADIADA {mins}min: {tarefas[idx]['descricao']}", meta=json.dumps(tarefas[idx], ensure_ascii=False))
-                        st.rerun()
-
-        # WEB_SEARCH
-        elif acao["action"] == "WEB_SEARCH":
-            q = (acao.get("search_query") or user_text).strip()
-            web = buscar_tavily(q)
-
-            if web:
-                add_event("web", f"QUERY: {q}\n\n{web[:2500]}")
-
-                prompt = (
-                    "Você recebeu resultados de busca (podem ter ruído).\n"
-                    "Responda em pt-BR com objetividade.\n"
-                    "- Se for cotação/preço/valor: traga número e unidade.\n"
-                    "- Se não houver número confiável: diga que não encontrou valor exato.\n"
-                    "- Cite a fonte pelo domínio ou título se possível.\n\n"
-                    f"RESULTADOS:\n{web}\n\nPERGUNTA:\n{user_text}"
-                )
-                resp = client.chat.completions.create(
-                    model=MODEL_ID,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.2
-                ).choices[0].message.content
-
-                st.markdown(resp)
-                st.session_state.memoria.append({"role": "assistant", "content": resp})
-                add_event("chat_assistant", resp)
-
-                if usou_voz:
-                    b = falar_bytes(resp[:220])
-                    if b:
-                        st.audio(b, format="audio/mp3", autoplay=True)
-            else:
-                msg = "Não consegui puxar dados da internet agora (busca vazia)."
-                st.warning(msg)
-                st.session_state.memoria.append({"role": "assistant", "content": msg})
-                add_event("chat_assistant", msg)
-
-        # CHAT
-        else:
-            msgs = build_chat_messages(user_text)
+        if web:
+            add_event("web", f"QUERY: {q}\n\n{web[:2500]}")
+            prompt = (
+                "Você recebeu resultados de busca (podem ter ruído).\n"
+                "Responda em pt-BR com objetividade.\n"
+                "- Se for cotação/preço/valor: traga número e unidade.\n"
+                "- Se não houver número confiável: diga que não encontrou valor exato.\n"
+                "- Cite a fonte pelo domínio ou título se possível.\n\n"
+                f"RESULTADOS:\n{web}\n\nPERGUNTA:\n{user_text}"
+            )
             resp = client.chat.completions.create(
                 model=MODEL_ID,
-                messages=msgs,
-                temperature=0.4
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2
             ).choices[0].message.content
 
-            st.markdown(resp)
             st.session_state.memoria.append({"role": "assistant", "content": resp})
             add_event("chat_assistant", resp)
-
-            if any(k in limpar_texto(user_text) for k in ["meu objetivo", "quero", "preciso", "decidi", "daqui pra frente", "sempre", "nunca"]):
-                update_summary_with_llm(f"Usuário disse: {user_text}\nAssistente respondeu: {resp[:400]}")
 
             if usou_voz:
                 b = falar_bytes(resp[:220])
                 if b:
-                    st.audio(b, format="audio/mp3", autoplay=True)
+                    st.session_state.last_audio_bytes = b
+            st.rerun()
+        else:
+            msg = "Não consegui puxar dados da internet agora (busca vazia)."
+            st.session_state.memoria.append({"role": "assistant", "content": msg})
+            add_event("chat_assistant", msg)
+            st.rerun()
+
+    # CHAT
+    else:
+        msgs = build_chat_messages(user_text)
+        resp = client.chat.completions.create(
+            model=MODEL_ID,
+            messages=msgs,
+            temperature=0.4
+        ).choices[0].message.content
+
+        st.session_state.memoria.append({"role": "assistant", "content": resp})
+        add_event("chat_assistant", resp)
+
+        if any(k in limpar_texto(user_text) for k in ["meu objetivo", "quero", "preciso", "decidi", "daqui pra frente", "sempre", "nunca"]):
+            update_summary_with_llm(f"Usuário disse: {user_text}\nAssistente respondeu: {resp[:400]}")
+
+        if usou_voz:
+            b = falar_bytes(resp[:220])
+            if b:
+                st.session_state.last_audio_bytes = b
+
+        st.rerun()
