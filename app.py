@@ -5,21 +5,19 @@ import edge_tts
 import asyncio
 
 # --- 1. Configuração ---
-st.set_page_config(page_title="Jarvis Autônomo", page_icon="🧠")
-st.title("Assistente Autônomo (Auto-Internet)")
+st.set_page_config(page_title="Jarvis Pro", page_icon="🧠")
+st.title("Assistente Autônomo (V2 Blindada)")
 
 # --- 2. Conexão ---
 try:
     client = Groq(api_key=st.secrets["GROQ_API_KEY"])
     tavily = TavilyClient(api_key=st.secrets["TAVILY_API_KEY"])
 except Exception as e:
-    st.error("⚠️ Erro nas Chaves API. Verifique os Secrets.")
+    st.error("⚠️ Erro nas Chaves API.")
     st.stop()
 
-# Modelo Principal (Cérebro)
+# Usaremos o modelo POTENTE para tudo agora, para evitar erros de julgamento
 MODEL_ID = "llama-3.3-70b-versatile"
-# Modelo Rápido (Para decidir se busca ou não - economiza tempo)
-ROUTER_MODEL = "llama3-8b-8192" 
 
 # --- 3. Memória ---
 if "memoria_v3" not in st.session_state:
@@ -27,7 +25,6 @@ if "memoria_v3" not in st.session_state:
 if "ultimo_audio" not in st.session_state:
     st.session_state.ultimo_audio = None
 
-# Sidebar Limpa (Sem botão de internet, agora é automático)
 if st.sidebar.button("🗑️ Limpar Tudo"):
     st.session_state.memoria_v3 = []
     st.session_state.ultimo_audio = None
@@ -37,19 +34,34 @@ if st.sidebar.button("🗑️ Limpar Tudo"):
 
 def cerebro_decisor(pergunta):
     """
-    Esta função é o 'Router'. Ela decide SE precisa buscar na web.
-    Retorna: True (Buscar) ou False (Responder direto)
+    Decide se busca ou não. Agora com 3 camadas de segurança.
     """
+    # 1. REDE DE SEGURANÇA (Palavras-chave que OBRIGAM a busca)
+    termos_obrigatorios = ["hoje", "agora", "cotação", "preço", "valor", "notícia", 
+                          "clima", "tempo", "dólar", "euro", "bitcoin", "jogo", "resultado", 
+                          "lançamento", "último", "atual", "quem ganhou"]
+    
+    if any(termo in pergunta.lower() for termo in termos_obrigatorios):
+        return True # Força a busca sem nem perguntar pra IA
+
+    # 2. DECISÃO DA IA (Com prompt reforçado)
     system_prompt = """
-    Você é um classificador de intenção. Analise a pergunta do usuário.
-    - Se a pergunta pedir dados em tempo real (cotações, clima, notícias, jogos, eventos recentes), responda 'BUSCAR'.
-    - Se for conversa fiada, ajuda técnica, código, resumo ou conhecimento geral atemporal, responda 'RESPONDER'.
-    Responda APENAS uma palavra: 'BUSCAR' ou 'RESPONDER'.
+    Você é um Supervisor de Busca. Sua única função é dizer 'BUSCAR' ou 'RESPONDER'.
+    
+    Regras RÍGIDAS:
+    - Perguntas sobre fatos atuais, preços, eventos recentes, clima ou pessoas vivas -> DIGA 'BUSCAR'.
+    - Perguntas teóricas, ajuda com código, traduções, poemas ou papo furado -> DIGA 'RESPONDER'.
+    
+    Exemplos:
+    User: "Quanto tá o dólar?" -> Assistant: BUSCAR
+    User: "Quem é o presidente do Brasil?" -> Assistant: BUSCAR
+    User: "Crie um poema." -> Assistant: RESPONDER
+    User: "O que é Python?" -> Assistant: RESPONDER
     """
     
     try:
         completion = client.chat.completions.create(
-            model=ROUTER_MODEL,
+            model=MODEL_ID, # Usando o 70b para ser mais esperto
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": pergunta}
@@ -59,10 +71,11 @@ def cerebro_decisor(pergunta):
         decisao = completion.choices[0].message.content.strip().upper()
         return "BUSCAR" in decisao
     except:
-        return False # Na dúvida, não busca
+        return False
 
 def buscar_tavily(pergunta):
     try:
+        # Aumentei para 'advanced' se quiser mais precisão, mas 'basic' é mais rápido
         response = tavily.search(query=pergunta, search_depth="basic", max_results=3)
         contexto = []
         for r in response.get('results', []):
@@ -112,9 +125,8 @@ with col1:
                     texto_input = transcricao
                     falar_resposta = True
 
-# --- 5. Fluxo Principal (O AGENTE) ---
+# --- 5. Fluxo Principal ---
 if texto_input:
-    # Mostra User
     st.session_state.memoria_v3.append({"role": "user", "content": texto_input})
     with chat_container.chat_message("user"):
         st.markdown(texto_input)
@@ -123,27 +135,25 @@ if texto_input:
         placeholder = st.empty()
         dados_web = ""
         
-        # --- PASSO 1: O CÉREBRO DECIDE ---
-        with st.status("🧠 Analisando sua pergunta...", expanded=True) as status:
+        # DECISÃO
+        with st.status("🧠 Pensando...", expanded=True) as status:
             precisa_busca = cerebro_decisor(texto_input)
             
             if precisa_busca:
-                status.write("🌍 Decidi pesquisar na web!")
+                status.write("🌍 Buscando informações atualizadas...")
                 raw_data = buscar_tavily(texto_input)
                 if raw_data:
                     dados_web = f"\n\n[DADOS DA INTERNET]:\n{raw_data}\n"
-                    status.update(label="✅ Dados encontrados!", state="complete", expanded=False)
+                    status.update(label="✅ Encontrei dados na rede!", state="complete", expanded=False)
                 else:
-                    status.update(label="❌ Falha na busca (seguindo sem dados)", state="error")
+                    status.update(label="❌ Erro na busca (tentando sem dados)", state="error", expanded=False)
             else:
-                status.write("📚 Usando conhecimento interno.")
-                status.update(label="✅ Respondendo direto", state="complete", expanded=False)
+                status.update(label="📚 Usando conhecimento interno", state="complete", expanded=False)
 
-        # --- PASSO 2: GERA RESPOSTA ---
+        # RESPOSTA
         try:
             with st.spinner("Formulando resposta..."):
-                # Monta o prompt com ou sem dados da web
-                msgs = [{"role": "system", "content": "Você é uma assistente prestativa. Se receber dados da internet, use-os. Se não, use seu conhecimento."}]
+                msgs = [{"role": "system", "content": "Você é uma assistente prestativa. Use os dados da web se fornecidos. Responda em Português."}]
                 for m in st.session_state.memoria_v3[:-1]:
                     if m.get("content"): msgs.append({"role": m["role"], "content": str(m["content"])})
                 
@@ -153,10 +163,10 @@ if texto_input:
                 resp = stream.choices[0].message.content
                 placeholder.markdown(resp)
                 
-                # --- PASSO 3: FALA (Se necessário) ---
                 if falar_resposta:
-                    audio_file = asyncio.run(falar(resp))
-                    st.audio(audio_file, format="audio/mp3", autoplay=True)
+                    with st.spinner("Gerando áudio..."):
+                        audio_file = asyncio.run(falar(resp))
+                        st.audio(audio_file, format="audio/mp3", autoplay=True)
                 
                 st.session_state.memoria_v3.append({"role": "assistant", "content": resp})
         
