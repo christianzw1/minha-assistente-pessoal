@@ -15,7 +15,7 @@ import time
 import sqlite3
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Tuple
 
 
 # =========================
@@ -30,13 +30,92 @@ FUSO_BR = ZoneInfo("America/Sao_Paulo")
 DB_PATH = "jarvis_memory.db"
 SUMMARY_PATH = "summary.txt"
 
-# lembretes: 0 = no horário/assim que vence, depois 10, 30, 120 min
-REMINDER_SCHEDULE_MIN = [0, 10, 30, 120]
-
+REMINDER_SCHEDULE_MIN = [0, 10, 30, 120]  # 0 = no horário; depois 10, 30, 120
 QUIET_START = 22
 QUIET_END = 7
 
 AUTO_REFRESH_MS = 5_000  # 5s
+
+
+# =========================
+# CSS / UI POLISH
+# =========================
+def inject_css():
+    st.markdown(
+        """
+        <style>
+        /* ----- Page width + spacing ----- */
+        .block-container {
+            max-width: 1100px;
+            padding-top: 28px;
+            padding-bottom: 40px;
+        }
+
+        /* ----- Hide Streamlit chrome (menu/footer/toolbar) ----- */
+        #MainMenu { visibility: hidden; }
+        footer { visibility: hidden; }
+        header { visibility: hidden; }
+
+        /* tenta esconder toolbars/overlays (funciona em várias versões) */
+        [data-testid="stToolbar"] { display: none !important; }
+        [data-testid="stDecoration"] { display: none !important; }
+        [data-testid="stStatusWidget"] { display: none !important; }
+        [data-testid="stDeployButton"] { display: none !important; }
+        .stDeployButton { display: none !important; }
+
+        /* ----- Background vibe ----- */
+        [data-testid="stAppViewContainer"] {
+            background: radial-gradient(1200px 600px at 10% 0%, rgba(120,80,255,0.15), transparent 55%),
+                        radial-gradient(1000px 500px at 90% 10%, rgba(0,200,255,0.12), transparent 55%),
+                        radial-gradient(900px 450px at 40% 90%, rgba(0,255,170,0.08), transparent 55%),
+                        linear-gradient(180deg, rgba(10,14,25,1) 0%, rgba(6,10,18,1) 100%);
+        }
+
+        /* ----- Cards ----- */
+        .card {
+            border: 1px solid rgba(255,255,255,0.08);
+            background: rgba(255,255,255,0.03);
+            border-radius: 16px;
+            padding: 16px 16px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.25);
+        }
+        .card-title {
+            font-size: 18px;
+            font-weight: 700;
+            margin-bottom: 6px;
+        }
+        .muted {
+            opacity: 0.75;
+            font-size: 13px;
+        }
+
+        /* ----- Tabs nicer ----- */
+        [data-testid="stTabs"] button {
+            border-radius: 999px !important;
+            padding: 10px 14px !important;
+        }
+
+        /* ----- Make chat input area breathe ----- */
+        [data-testid="stChatInput"] {
+            border-radius: 14px;
+        }
+
+        /* ----- Buttons radius ----- */
+        .stButton button {
+            border-radius: 12px !important;
+            padding: 8px 12px !important;
+        }
+
+        /* ----- Mobile tweaks ----- */
+        @media (max-width: 768px) {
+            .block-container { padding-top: 18px; }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+inject_css()
 
 
 # =========================
@@ -60,7 +139,6 @@ if "ultimo_audio_hash" not in st.session_state:
     st.session_state.ultimo_audio_hash = None
 
 if "last_alert_fingerprint" not in st.session_state:
-    # fingerprint do último alerta proativo disparado (task_id + next_remind_at)
     st.session_state.last_alert_fingerprint = None
 
 if "last_input_sig" not in st.session_state:
@@ -98,7 +176,6 @@ def em_horario_silencioso(agora: datetime) -> bool:
 # NOTIFICAÇÃO DO NAVEGADOR (JS)
 # =========================
 def request_notification_permission():
-    # IMPORTANTE: browsers exigem gesto do usuário (clique) pra permitir.
     components.html(
         """
         <script>
@@ -114,7 +191,6 @@ def request_notification_permission():
     )
 
 def browser_notify(title: str, body: str):
-    # Notificação + beep curto (pode ser bloqueado por autoplay em alguns navegadores)
     payload_title = json.dumps(title)
     payload_body = json.dumps(body)
     components.html(
@@ -127,7 +203,7 @@ def browser_notify(title: str, body: str):
             }}
           }} catch(e) {{}}
 
-          // Beep (WebAudio) - pode falhar se o browser bloquear audio sem gesto
+          // Beep curto (pode falhar se o browser bloquear áudio sem gesto)
           try {{
             const AudioContext = window.AudioContext || window.webkitAudioContext;
             if (AudioContext) {{
@@ -322,7 +398,7 @@ def normalizar_tarefa(d: dict) -> dict:
     d.setdefault("last_reminded_at", None)
     d.setdefault("snoozed_until", None)
     d.setdefault("created_at", format_dt(agora))
-    d.setdefault("next_remind_at", d.get("data_hora"))  # primeira vez: no horário
+    d.setdefault("next_remind_at", d.get("data_hora"))
     return d
 
 
@@ -416,18 +492,12 @@ def extrair_dados_tarefa(texto: str):
 # =========================
 # ROUTER (regras + LLM)
 # =========================
-TIME_SENSITIVE_HINTS = [
-    "agora", "hoje", "últimas", "ultimas", "atual", "atualmente",
-    "neste momento", "ao vivo", "recentemente", "essa semana", "esse mês", "este mês"
-]
-FACT_QUERIES = [
-    "cotação", "cotacao", "preço", "preco", "valor", "quanto ta", "quanto tá", "quanto está",
-    "taxa", "selic", "dólar", "dolar", "euro", "inflação", "inflacao",
-    "clima", "tempo", "previsão", "previsao",
-    "placar", "resultado", "quem ganhou", "tabela", "classificação", "classificacao",
-    "notícia", "noticia",
-    "bitcoin", "btc", "ethereum", "eth", "cripto", "criptomoeda",
-]
+TIME_SENSITIVE_HINTS = ["agora", "hoje", "últimas", "ultimas", "atual", "atualmente", "neste momento", "ao vivo", "recentemente", "essa semana", "esse mês", "este mês"]
+FACT_QUERIES = ["cotação", "cotacao", "preço", "preco", "valor", "quanto ta", "quanto tá", "quanto está",
+                "taxa", "selic", "dólar", "dolar", "euro", "inflação", "inflacao",
+                "clima", "tempo", "previsão", "previsao",
+                "placar", "resultado", "quem ganhou", "tabela", "classificação", "classificacao",
+                "notícia", "noticia", "bitcoin", "btc", "ethereum", "eth", "cripto", "criptomoeda"]
 QUESTION_WORDS = ["qual", "quanto", "quando", "onde", "quem", "por que", "porque", "como"]
 
 def parece_pergunta_factual(texto: str) -> bool:
@@ -646,13 +716,12 @@ def build_chat_messages(user_text: str):
 
 
 # =========================
-# VIGIA PROATIVO (ROBUSTO)
+# VIGIA PROATIVO
 # =========================
 def compute_next_remind_at(agora: datetime, t: dict) -> Optional[datetime]:
     if t.get("status") == "silenciada":
         return None
 
-    # Snooze tem prioridade se estiver no futuro
     if t.get("snoozed_until"):
         try:
             su = parse_dt(t["snoozed_until"])
@@ -661,7 +730,6 @@ def compute_next_remind_at(agora: datetime, t: dict) -> Optional[datetime]:
         except Exception:
             pass
 
-    # Caso normal: next_remind_at ou data_hora
     try:
         nr = parse_dt(t.get("next_remind_at") or t["data_hora"])
         return nr
@@ -695,7 +763,6 @@ def pick_due_task(tarefas: list, agora: datetime) -> Optional[dict]:
         except Exception:
             continue
 
-        # Dispara no horário: agora >= due
         if agora < due:
             continue
 
@@ -714,7 +781,7 @@ def pick_due_task(tarefas: list, agora: datetime) -> Optional[dict]:
 
 
 # =========================
-# AUTOREFRESH (sempre no topo)
+# AUTOREFRESH
 # =========================
 st_autorefresh(interval=AUTO_REFRESH_MS, key="tick")
 
@@ -728,26 +795,101 @@ salvar_tarefas(tarefas)
 
 
 # =========================
-# SIDEBAR SIMPLES
+# PROACTIVE ALERT
 # =========================
-with st.sidebar:
-    st.header("Agenda")
-    st.caption(f"Agora: {agora.strftime('%H:%M:%S')} (BR)")
-    st.caption(f"Auto-refresh: {AUTO_REFRESH_MS/1000:.0f}s")
+mensagem_alerta = None
+tarefa_alertada = pick_due_task(tarefas, agora)
 
-    cA, cB = st.columns(2)
-    with cA:
-        if st.button("Ativar notificações"):
+if tarefa_alertada:
+    next_at_str = tarefa_alertada.get("next_remind_at") or tarefa_alertada.get("data_hora")
+    fingerprint = f"{tarefa_alertada['id']}::{next_at_str}"
+
+    if st.session_state.last_alert_fingerprint != fingerprint:
+        st.session_state.last_alert_fingerprint = fingerprint
+
+        mensagem_alerta = (
+            f"🔔 **Lembrete:** {tarefa_alertada['descricao']}\n\n"
+            f"Horário: **{tarefa_alertada['data_hora']}**\n\n"
+            "Você pode responder: **feito**, **adiar 30 min**, **silenciar**."
+        )
+
+        browser_notify("Lembrete", tarefa_alertada["descricao"])
+
+        b = falar_bytes("Ei! Você tem um lembrete.")
+        if b:
+            st.session_state.last_audio_bytes = b
+
+        updated = schedule_after_fire(agora, tarefa_alertada)
+        tarefas2 = []
+        for x in tarefas:
+            tarefas2.append(updated if x.get("id") == tarefa_alertada["id"] else x)
+        tarefas = tarefas2
+        salvar_tarefas(tarefas)
+
+        add_event("task", f"LEMBRETE: {tarefa_alertada['descricao']}", meta=json.dumps(updated, ensure_ascii=False))
+
+
+# =========================
+# HEADER (bonito)
+# =========================
+top = st.container()
+with top:
+    c1, c2 = st.columns([0.72, 0.28])
+    with c1:
+        st.markdown(
+            """
+            <div class="card">
+              <div class="card-title">🤖 Assistente Pessoal (Full Control)</div>
+              <div class="muted">Agenda + memória + web + voz • tudo em um lugar</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with c2:
+        st.markdown(
+            f"""
+            <div class="card">
+              <div class="card-title">🕒 {agora.strftime('%H:%M')}</div>
+              <div class="muted">Auto-refresh: {AUTO_REFRESH_MS//1000}s • BR</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    st.write("")
+    cc1, cc2, cc3 = st.columns([0.35, 0.35, 0.30])
+    with cc1:
+        if st.button("🔔 Ativar notificações", use_container_width=True):
             request_notification_permission()
-            st.success("Se o navegador perguntar, clique em **Permitir**.")
-    with cB:
-        if st.button("Resumo"):
-            st.info(load_summary())
+            st.toast("Permissão solicitada. Se o navegador perguntar, toque em **Permitir**.", icon="✅")
+    with cc2:
+        if em_horario_silencioso(agora):
+            st.info("Modo silencioso (22:00–07:00)")
+        else:
+            st.success("Alertas ativos")
+    with cc3:
+        if st.button("🧠 Ver resumo rápido", use_container_width=True):
+            st.toast(load_summary()[:180] + ("..." if len(load_summary()) > 180 else ""), icon="🧠")
 
-    st.divider()
+
+st.write("")
+
+
+# =========================
+# TABS: Chat / Agenda / Memória
+# =========================
+tab_chat, tab_agenda, tab_mem = st.tabs(["💬 Chat", "📌 Agenda", "🧠 Memória"])
+
+
+# =========================
+# TAB: AGENDA
+# =========================
+with tab_agenda:
+    st.markdown("<div class='card-title'>📌 Sua agenda</div>", unsafe_allow_html=True)
+    st.write("")
 
     if not tarefas:
-        st.success("Livre!")
+        st.markdown("<div class='card'>✅ <b>Livre!</b> Nenhuma tarefa agendada.</div>", unsafe_allow_html=True)
     else:
         def sort_key(x):
             try:
@@ -764,18 +906,28 @@ with st.sidebar:
 
             status = t.get("status", "ativa")
             badge = "🔕" if status == "silenciada" else ("🔥" if atrasada else "📌")
-            st.write(f"{badge} **{t.get('data_hora','??:??').split(' ')[1]}** — {t.get('descricao','(sem descrição)')}")
+            hora = t.get("data_hora", "??").split(" ")[1] if " " in t.get("data_hora", "") else t.get("data_hora", "??")
 
-            b1, b2 = st.columns(2)
+            st.markdown(
+                f"""
+                <div class="card">
+                  <div class="card-title">{badge} {hora} — {t.get('descricao','(sem descrição)')}</div>
+                  <div class="muted">Status: {status} • Lembretes: {t.get('remind_count',0)}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            b1, b2, _ = st.columns([0.22, 0.22, 0.56])
             with b1:
-                if st.button("Feito", key=f"feito_{t['id']}"):
+                if st.button("✅ Feito", key=f"feito_{t['id']}", use_container_width=True):
                     tarefas2 = [x for x in tarefas if x.get("id") != t.get("id")]
                     salvar_tarefas(tarefas2)
                     add_event("task", f"CONCLUÍDA (botão): {t['descricao']}", meta=json.dumps(t, ensure_ascii=False))
                     update_summary_with_llm(f"Tarefa concluída: {t['descricao']}")
                     st.rerun()
             with b2:
-                if st.button("Silenciar", key=f"sil_{t['id']}"):
+                if st.button("🔕 Silenciar", key=f"sil_{t['id']}", use_container_width=True):
                     for x in tarefas:
                         if x.get("id") == t.get("id"):
                             x["status"] = "silenciada"
@@ -784,103 +936,68 @@ with st.sidebar:
                     add_event("task", f"SILENCIADA (botão): {t['descricao']}", meta=json.dumps(t, ensure_ascii=False))
                     st.rerun()
 
-    with st.expander("Debug", expanded=False):
+            st.write("")
+
+
+# =========================
+# TAB: MEMÓRIA
+# =========================
+with tab_mem:
+    st.markdown("<div class='card-title'>🧠 Memória</div>", unsafe_allow_html=True)
+    st.write("")
+
+    with st.expander("📄 Resumo vivo", expanded=True):
+        st.markdown(f"<div class='card'>{load_summary()}</div>", unsafe_allow_html=True)
+
+    with st.expander("🧪 Debug (opcional)", expanded=False):
         if st.button("Últimos 20 eventos"):
             evs = get_last_events(20)
-            st.write([{"ts": a, "kind": b, "content": c[:140]} for a, b, c in evs])
+            st.write([{"ts": a, "kind": b, "content": c[:160]} for a, b, c in evs])
         if st.button("Limpar áudio"):
             st.session_state.last_audio_bytes = None
             st.rerun()
 
 
 # =========================
-# ALERTA PROATIVO (SEM PRECISAR MENSAGEM)
+# TAB: CHAT
 # =========================
-mensagem_alerta = None
-tarefa_alertada = pick_due_task(tarefas, agora)
+with tab_chat:
+    if mensagem_alerta:
+        st.warning(mensagem_alerta)
+        st.toast(f"Lembrete: {tarefa_alertada['descricao']}", icon="🔔")
+        st.session_state.memoria.append({"role": "assistant", "content": mensagem_alerta})
 
-if tarefa_alertada:
-    # fingerprint baseado no próximo lembrete (não no "minuto atual")
-    # assim não duplica e não depende do clock do refresh
-    next_at_str = tarefa_alertada.get("next_remind_at") or tarefa_alertada.get("data_hora")
-    fingerprint = f"{tarefa_alertada['id']}::{next_at_str}"
+    if st.session_state.last_audio_bytes:
+        st.audio(st.session_state.last_audio_bytes, format="audio/mp3")
 
-    if st.session_state.last_alert_fingerprint != fingerprint:
-        st.session_state.last_alert_fingerprint = fingerprint
+    # histórico do chat
+    for m in st.session_state.memoria:
+        with st.chat_message(m["role"]):
+            st.markdown(m["content"])
 
-        mensagem_alerta = (
-            f"🔔 **Lembrete:** {tarefa_alertada['descricao']}\n\n"
-            f"Horário: **{tarefa_alertada['data_hora']}**\n\n"
-            "Você pode responder: **feito**, **adiar 30 min**, **silenciar**."
-        )
+    st.divider()
 
-        # tenta notificação do navegador
-        browser_notify("Lembrete", tarefa_alertada["descricao"])
+    # INPUT (texto + voz)
+    c1, c2 = st.columns([0.18, 0.82])
+    texto = None
+    usou_voz = False
 
-        # também tenta TTS curto (fica dentro da página)
-        b = falar_bytes("Ei! Você tem um lembrete.")
-        if b:
-            st.session_state.last_audio_bytes = b
+    with c2:
+        texto = st.chat_input("Mensagem...")
 
-        # atualiza tarefa (agenda próximo lembrete)
-        updated = schedule_after_fire(agora, tarefa_alertada)
-        tarefas2 = []
-        for x in tarefas:
-            tarefas2.append(updated if x.get("id") == tarefa_alertada["id"] else x)
-        tarefas = tarefas2
-        salvar_tarefas(tarefas)
-
-        add_event("task", f"LEMBRETE: {tarefa_alertada['descricao']}", meta=json.dumps(updated, ensure_ascii=False))
-
-
-# =========================
-# UI PRINCIPAL (SIMPLES)
-# =========================
-st.title("Assistente Pessoal")
-
-if em_horario_silencioso(agora):
-    st.info("Modo silencioso ativo (sem alertas) — entre 22:00 e 07:00.")
-
-if mensagem_alerta:
-    st.warning(mensagem_alerta)
-    st.toast(f"Lembrete: {tarefa_alertada['descricao']}", icon="🔔")
-    # joga no chat também (uma vez por fingerprint)
-    st.session_state.memoria.append({"role": "assistant", "content": mensagem_alerta})
-
-if st.session_state.last_audio_bytes:
-    st.audio(st.session_state.last_audio_bytes, format="audio/mp3")
-
-# histórico do chat
-for m in st.session_state.memoria:
-    with st.chat_message(m["role"]):
-        st.markdown(m["content"])
-
-st.divider()
-
-
-# =========================
-# INPUT (texto + voz)
-# =========================
-c1, c2 = st.columns([0.2, 0.8])
-texto = None
-usou_voz = False
-
-with c2:
-    texto = st.chat_input("Mensagem...")
-
-with c1:
-    up = st.audio_input("🎙️")
-    if up is not None:
-        try:
-            b = up.getvalue()
-            h = hashlib.sha256(b).hexdigest()
-            if h != st.session_state.ultimo_audio_hash:
-                st.session_state.ultimo_audio_hash = h
-                with st.spinner("Transcrevendo..."):
-                    texto = ouvir_audio(up)
-                    usou_voz = True
-        except Exception:
-            pass
+    with c1:
+        up = st.audio_input("🎙️")
+        if up is not None:
+            try:
+                b = up.getvalue()
+                h = hashlib.sha256(b).hexdigest()
+                if h != st.session_state.ultimo_audio_hash:
+                    st.session_state.ultimo_audio_hash = h
+                    with st.spinner("Transcrevendo..."):
+                        texto = ouvir_audio(up)
+                        usou_voz = True
+            except Exception:
+                pass
 
 
 # =========================
@@ -897,7 +1014,6 @@ if texto and should_process_input(str(texto)):
 
     acao = decidir_acao(user_text, tarefas)
 
-    # DEBUG
     if acao["action"] == "SHOW_SUMMARY":
         resumo = load_summary()
         st.session_state.memoria.append({"role": "assistant", "content": resumo})
@@ -920,7 +1036,7 @@ if texto and should_process_input(str(texto)):
         d = extrair_dados_tarefa(user_text)
         if d:
             d = normalizar_tarefa(d)
-            d["next_remind_at"] = d["data_hora"]  # garante lembrete NO HORÁRIO
+            d["next_remind_at"] = d["data_hora"]
             tarefas.append(d)
             salvar_tarefas(tarefas)
 
