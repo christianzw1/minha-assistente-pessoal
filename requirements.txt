@@ -2,3 +2,4 @@ streamlit
 groq
 edge-tts
 asyncio
+duckduckgo-search
