@@ -23,14 +23,11 @@ MODEL_ID = "llama-3.3-70b-versatile"
 ARQUIVO_TAREFAS = "tarefas.json"
 FUSO_BR = ZoneInfo("America/Sao_Paulo")
 
-# lembrete natural: na hora, 10min, 30min, 2h e depois silencia
-REMINDER_SCHEDULE_MIN = [0, 10, 30, 120]
-
-# não perturbar
+REMINDER_SCHEDULE_MIN = [0, 10, 30, 120]  # lembretes naturais
 QUIET_START = 22
 QUIET_END = 7
 
-# refresh a cada 10s, sem loop infinito
+# refresh leve (sem loop agressivo)
 st_autorefresh(interval=10_000, key="auto_refresh")
 
 
@@ -87,30 +84,16 @@ def em_horario_silencioso(agora: datetime):
 
 
 def normalizar_tarefa(d: dict):
-    """Garante campos que controlam lembrete por tarefa (não global)."""
     agora = datetime.now(FUSO_BR)
     d = dict(d)
-
     d.setdefault("id", str(uuid.uuid4())[:8])
-    d.setdefault("status", "ativa")              # ativa | silenciada
-    d.setdefault("remind_count", 0)             # quantas vezes já lembrou
-    d.setdefault("last_reminded_at", None)      # "YYYY-MM-DD HH:MM"
-    d.setdefault("snoozed_until", None)         # "YYYY-MM-DD HH:MM"
+    d.setdefault("status", "ativa")         # ativa | silenciada
+    d.setdefault("remind_count", 0)
+    d.setdefault("last_reminded_at", None)
+    d.setdefault("snoozed_until", None)
     d.setdefault("created_at", format_dt(agora))
-    d.setdefault("next_remind_at", d.get("data_hora"))  # primeiro lembrete na hora da tarefa
-
+    d.setdefault("next_remind_at", d.get("data_hora"))  # primeiro lembrete no horário
     return d
-
-
-def extrair_minutos(texto: str, padrao=30):
-    m = re.search(r"(\d+)\s*(min|mins|minuto|minutos|h|hora|horas)", texto.lower())
-    if not m:
-        return padrao
-    n = int(m.group(1))
-    unidade = m.group(2)
-    if unidade.startswith("h") or "hora" in unidade:
-        return n * 60
-    return n
 
 
 def limpar_texto(s: str):
@@ -121,64 +104,152 @@ def limpar_texto(s: str):
 
 
 # =========================
-# INTENÇÕES
+# INTENÇÕES (CORRIGIDO)
 # =========================
-def identificar_intencao(texto):
-    t = texto.lower()
+def identificar_intencao(texto: str):
+    t = limpar_texto(texto)
 
-    # CONCLUIR
-    termos_concluir = [
-        "já fiz", "ja fiz", "feito", "conclu", "termin", "resolvi",
-        "já abri", "ja abri", "já fechei", "ja fechei", "finalizei",
-        "pode parar", "pode cancelar"
-    ]
-    if any(x in t for x in termos_concluir):
-        return "CONCLUIR"
-
-    # SILENCIAR (não remove, só para de cobrar)
-    termos_silenciar = [
-        "desconsidera", "cancela", "cancelar", "para de", "pare de",
-        "não me lembra", "nao me lembra", "silencia", "chega"
-    ]
-    if any(x in t for x in termos_silenciar):
-        return "SILENCIAR"
-
-    # ADIAR
-    termos_adiar = ["adiar", "mais tarde", "daqui a", "me lembra em", "snooze"]
-    if any(x in t for x in termos_adiar):
-        return "ADIAR"
-
-    # AGENDAR
-    termos_agenda = ["lembr", "agend", "anot", "marc", "cobr", "avis"]
-    if any(x in t for x in termos_agenda):
+    # 1) Se começa com “me lembra…” / “lembra de…” -> AGENDAR SEMPRE
+    if re.search(r"^(me\s+lembra|lembra\s+de|me\s+avisa|avisa\s+me|me\s+cobra)", t):
         return "AGENDAR"
 
-    # BUSCAR
-    if any(x in t for x in ["hoje", "preço", "notícia", "valor", "dólar", "tempo", "quem ganhou"]):
+    # 2) ADIAR explícito
+    if any(x in t for x in ["adiar", "mais tarde", "daqui a", "me lembra em", "snooze"]):
+        return "ADIAR"
+
+    # 3) SILENCIAR explícito (sem “já fiz”)
+    if any(x in t for x in ["desconsidera", "cancela", "cancelar", "para de", "pare de", "silencia", "não me lembra", "nao me lembra"]):
+        # se o usuário disse que já fez, vira CONCLUIR
+        if any(x in t for x in ["ja fiz", "já fiz", "feito", "terminei", "conclui", "finalizei", "resolvi", "já abri", "ja abri", "já fechei", "ja fechei"]):
+            return "CONCLUIR"
+        return "SILENCIAR"
+
+    # 4) CONCLUIR
+    if any(x in t for x in ["ja fiz", "já fiz", "feito", "terminei", "conclui", "finalizei", "resolvi", "já abri", "ja abri", "já fechei", "ja fechei"]):
+        return "CONCLUIR"
+
+    # 5) BUSCAR
+    if any(x in t for x in ["preço", "notícia", "valor", "dólar", "dolar", "tempo", "quem ganhou"]):
         return "BUSCAR"
 
     return "RESPONDER"
 
 
 # =========================
-# HELPERS: escolher tarefa (sem depender 100% do LLM)
+# PARSER RELATIVO + AJUSTE FUTURO (CORRIGIDO)
 # =========================
-def escolher_tarefa_por_heuristica(texto_usuario: str, tarefas: list):
+def parse_relativo(texto: str):
     """
-    Regras:
-    1) Se só existe 1 tarefa -> escolhe ela.
-    2) Se só existe 1 tarefa atrasada ativa -> escolhe ela.
-    3) Se achar palavra-chave (ex: HL/HR/AHL/DPR) presente na descrição -> escolhe.
-    4) Se nada disso, retorna -1 (aí usamos LLM como último recurso).
+    Detecta:
+    - daqui um minuto / daqui 2 minutos
+    - daqui 1 hora / daqui 3 horas
+    - em 10 min
+    Retorna timedelta ou None
     """
+    t = limpar_texto(texto)
+
+    # “daqui um minuto”
+    if "daqui um minuto" in t or "daqui 1 minuto" in t:
+        return timedelta(minutes=1)
+
+    m = re.search(r"(daqui\s+a|daqui|em)\s+(\d+)\s*(min|minuto|minutos|h|hora|horas)", t)
+    if not m:
+        return None
+
+    n = int(m.group(2))
+    unidade = m.group(3)
+
+    if unidade.startswith("h") or "hora" in unidade:
+        return timedelta(hours=n)
+    return timedelta(minutes=n)
+
+
+def ajustar_para_futuro(dt_extraido: datetime, agora: datetime):
+    """
+    Garante que o horário agendado seja o PRÓXIMO futuro.
+    Ex:
+      agora = 19:13
+      dt_extraido = hoje 07:19 -> tenta 19:19 hoje (se fizer sentido) senão joga pro dia seguinte
+    """
+    # se já é futuro, ok
+    if dt_extraido > agora + timedelta(seconds=5):
+        return dt_extraido
+
+    # tenta +12h (resolve 07:19 vs 19:19)
+    tentativa = dt_extraido + timedelta(hours=12)
+    if tentativa.hour <= 23 and tentativa > agora + timedelta(seconds=5):
+        return tentativa
+
+    # senão joga pro dia seguinte no mesmo horário
+    return dt_extraido + timedelta(days=1)
+
+
+def extrair_descricao(texto: str):
+    """
+    Remove gatilhos tipo “me lembra de”, “daqui um minuto”, “por favor” etc.
+    """
+    t = limpar_texto(texto)
+    t = re.sub(r"^(me\s+lembra\s+de|me\s+lembra|lembra\s+de|me\s+avisa|avisa\s+me|me\s+cobra)\s+", "", t)
+    t = re.sub(r"(daqui\s+a\s+\d+\s*(min|minuto|minutos|h|hora|horas)|daqui\s+um\s+minuto|em\s+\d+\s*(min|minuto|minutos|h|hora|horas))", "", t)
+    t = re.sub(r"\b(por\s+favor|pfv|porfav(or)?)\b", "", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t if t else "tarefa"
+
+
+def extrair_dados_tarefa(texto: str):
+    """
+    1) Se for relativo -> agenda agora + delta.
+    2) Senão usa LLM pra pegar horário.
+    3) Ajusta para próximo futuro.
+    """
+    agora = datetime.now(FUSO_BR)
+
+    delta = parse_relativo(texto)
+    if delta:
+        dt = agora + delta
+        return {"descricao": extrair_descricao(texto), "data_hora": format_dt(dt)}
+
+    agora_br = agora.strftime("%Y-%m-%d %H:%M")
+    prompt = (
+        f"Hoje é {agora_br} (America/Sao_Paulo).\n"
+        f'O usuário disse: "{texto}".\n'
+        "Extraia uma tarefa e uma data/hora no formato YYYY-MM-DD HH:MM.\n"
+        "Se o usuário citar apenas hora/minuto, use a data de hoje.\n"
+        "IMPORTANTE: escolha o PRÓXIMO horário futuro possível.\n"
+        "Responda APENAS em JSON: "
+        "{\"descricao\": \"...\", \"data_hora\": \"YYYY-MM-DD HH:MM\"}"
+    )
+
+    try:
+        resp = client.chat.completions.create(
+            model=MODEL_ID,
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            temperature=0
+        )
+        data = json.loads(resp.choices[0].message.content)
+        if "descricao" not in data or "data_hora" not in data:
+            return None
+
+        dt_extraido = parse_dt(data["data_hora"])
+        dt_corrigido = ajustar_para_futuro(dt_extraido, agora)
+        data["data_hora"] = format_dt(dt_corrigido)
+        return data
+    except Exception:
+        return None
+
+
+# =========================
+# ESCOLHER TAREFA (ROBUSTO)
+# =========================
+def escolher_tarefa(texto_usuario: str, tarefas: list):
     if not tarefas:
         return -1
-
     if len(tarefas) == 1:
         return 0
 
+    # tenta escolher a tarefa mais atrasada ativa
     agora = datetime.now(FUSO_BR)
-
     atrasadas = []
     for i, t in enumerate(tarefas):
         try:
@@ -188,11 +259,10 @@ def escolher_tarefa_por_heuristica(texto_usuario: str, tarefas: list):
                 atrasadas.append(i)
         except Exception:
             pass
-
     if len(atrasadas) == 1:
         return atrasadas[0]
 
-    # tenta match por token forte
+    # tenta token forte
     texto_limpo = limpar_texto(texto_usuario)
     tokens_fortes = ["hl", "hr", "ahl", "dpr", "rib"]
     for tok in tokens_fortes:
@@ -201,26 +271,13 @@ def escolher_tarefa_por_heuristica(texto_usuario: str, tarefas: list):
                 if tok in limpar_texto(t.get("descricao", "")):
                     return i
 
-    return -1
-
-
-def encontrar_tarefa_por_llm(texto_usuario: str, tarefas: list):
-    """Último recurso: LLM escolhe o índice."""
-    linhas = []
-    for i, t in enumerate(tarefas):
-        linhas.append(f"ID {i}: {t.get('descricao','')} (em {t.get('data_hora','')})")
-    lista_texto = "\n".join(linhas)
-
-    prompt = f"""
-Lista de tarefas:
-{lista_texto}
-
-O usuário disse: "{texto_usuario}"
-
-Qual é o ID da tarefa que ele quer afetar (concluir/silenciar/adiar)?
-Responda APENAS o número (ex: 0). Se nenhuma bater, responda -1.
-"""
-
+    # fallback LLM
+    linhas = [f"ID {i}: {t.get('descricao','')} (em {t.get('data_hora','')})" for i, t in enumerate(tarefas)]
+    prompt = (
+        "Lista de tarefas:\n" + "\n".join(linhas) + "\n\n"
+        f'O usuário disse: "{texto_usuario}"\n'
+        "Qual ID ele quer afetar? Responda SÓ o número. Se nenhuma, -1."
+    )
     try:
         resp = client.chat.completions.create(
             model=MODEL_ID,
@@ -234,40 +291,9 @@ Responda APENAS o número (ex: 0). Se nenhuma bater, responda -1.
         return -1
 
 
-def escolher_tarefa(texto_usuario: str, tarefas: list):
-    idx = escolher_tarefa_por_heuristica(texto_usuario, tarefas)
-    if idx != -1:
-        return idx
-    return encontrar_tarefa_por_llm(texto_usuario, tarefas)
-
-
 # =========================
-# EXTRATORES
+# WEB / AUDIO
 # =========================
-def extrair_dados_tarefa(texto):
-    agora_br = datetime.now(FUSO_BR).strftime("%Y-%m-%d %H:%M")
-    prompt = (
-        f"Hoje é {agora_br}. O usuário disse: \"{texto}\".\n"
-        "Extraia uma tarefa e uma data/hora no formato YYYY-MM-DD HH:MM.\n"
-        "Se não tiver hora, use 18:00 de hoje.\n"
-        "Responda APENAS em JSON assim:\n"
-        "{\"descricao\": \"...\", \"data_hora\": \"YYYY-MM-DD HH:MM\"}"
-    )
-    try:
-        resp = client.chat.completions.create(
-            model=MODEL_ID,
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-            temperature=0
-        )
-        data = json.loads(resp.choices[0].message.content)
-        if "descricao" in data and "data_hora" in data:
-            return data
-        return None
-    except Exception:
-        return None
-
-
 def buscar_tavily(q):
     try:
         r = tavily.search(query=q, max_results=2)
@@ -308,7 +334,6 @@ salvar_tarefas(tarefas)
 
 agora = datetime.now(FUSO_BR)
 mensagem_cobranca = None
-tarefa_cobrada = None
 
 if not em_horario_silencioso(agora):
     for t in tarefas:
@@ -318,19 +343,15 @@ if not em_horario_silencioso(agora):
 
             data_tarefa = parse_dt(t["data_hora"])
             if agora <= data_tarefa:
-                continue  # ainda não venceu
+                continue
 
-            # snooze
-            if t.get("snoozed_until"):
-                if agora < parse_dt(t["snoozed_until"]):
-                    continue
+            if t.get("snoozed_until") and agora < parse_dt(t["snoozed_until"]):
+                continue
 
-            # só lembra se chegou no next_remind_at
             next_at = parse_dt(t.get("next_remind_at", t["data_hora"]))
             if agora < next_at:
                 continue
 
-            # dispara UMA cobrança por ciclo
             mensagem_cobranca = (
                 f"🔔 Ei! Já passou do horário de **{t['descricao']}**.\n\n"
                 "Responda:\n"
@@ -338,9 +359,7 @@ if not em_horario_silencioso(agora):
                 "- **adiar 30 min**\n"
                 "- **desconsidera / para de lembrar**"
             )
-            tarefa_cobrada = t
 
-            # atualiza estado da tarefa
             t["last_reminded_at"] = format_dt(agora)
             t["remind_count"] = int(t.get("remind_count", 0)) + 1
 
@@ -377,16 +396,11 @@ with col_agenda:
     if tarefas:
         for t in tarefas:
             try:
-                dt_task = parse_dt(t["data_hora"])
-                atrasada = agora > dt_task
+                atrasada = agora > parse_dt(t["data_hora"])
             except Exception:
                 atrasada = False
 
-            if t.get("status") == "silenciada":
-                icone = "🔕"
-            else:
-                icone = "🔥" if atrasada else "📅"
-
+            icone = "🔕" if t.get("status") == "silenciada" else ("🔥" if atrasada else "📅")
             st.warning(f"{icone} {t['data_hora'].split(' ')[1]}\n{t['descricao']}")
 
             cbtn1, cbtn2 = st.columns([0.5, 0.5])
@@ -440,13 +454,26 @@ with col_main:
 
         with container.chat_message("assistant"):
             intencao = identificar_intencao(texto)
-
-            # recarrega tarefas sempre (estado atual)
             tarefas = [normalizar_tarefa(t) for t in carregar_tarefas()]
             salvar_tarefas(tarefas)
 
-            # -------- CONCLUIR / SILENCIAR / ADIAR --------
-            if intencao in ["CONCLUIR", "SILENCIAR", "ADIAR"]:
+            if intencao == "AGENDAR":
+                d = extrair_dados_tarefa(texto)
+                if d:
+                    d = normalizar_tarefa(d)
+                    tarefas.append(d)
+                    salvar_tarefas(tarefas)
+
+                    msg = f"📌 Agendado: **{d['descricao']}** às **{d['data_hora'].split(' ')[1]}**."
+                    st.success(msg)
+                    st.session_state.memoria_v3.append({"role": "assistant", "content": msg})
+                    st.rerun()
+                else:
+                    msg = "Não consegui extrair tarefa e horário. Ex: 'me lembra de fechar a HL às 19:19' ou 'daqui 1 minuto'."
+                    st.warning(msg)
+                    st.session_state.memoria_v3.append({"role": "assistant", "content": msg})
+
+            elif intencao in ["CONCLUIR", "SILENCIAR", "ADIAR"]:
                 if not tarefas:
                     msg = "Sua agenda já está vazia!"
                     st.info(msg)
@@ -461,18 +488,9 @@ with col_main:
                         if intencao == "CONCLUIR":
                             removida = tarefas.pop(idx)
                             salvar_tarefas(tarefas)
-
                             msg = f"✅ Marquei como feito: **{removida['descricao']}**."
                             st.success(msg)
                             st.session_state.memoria_v3.append({"role": "assistant", "content": msg})
-
-                            if usou_voz:
-                                try:
-                                    mp3 = asyncio.run(falar("Maravilha! Tarefa concluída."))
-                                    st.audio(mp3, format="audio/mp3", autoplay=True)
-                                except Exception:
-                                    pass
-
                             st.rerun()
 
                         elif intencao == "SILENCIAR":
@@ -480,44 +498,30 @@ with col_main:
                             tarefas[idx]["status"] = "silenciada"
                             tarefas[idx]["next_remind_at"] = format_dt(agora2 + timedelta(days=365))
                             salvar_tarefas(tarefas)
-
                             msg = f"🔕 Beleza. Parei de te lembrar: **{tarefas[idx]['descricao']}**."
                             st.success(msg)
                             st.session_state.memoria_v3.append({"role": "assistant", "content": msg})
                             st.rerun()
 
                         elif intencao == "ADIAR":
-                            mins = extrair_minutos(texto, 30)
+                            mins = 30
+                            # extrai minutos do texto
+                            m = re.search(r"(\d+)\s*(min|minuto|minutos|h|hora|horas)", limpar_texto(texto))
+                            if m:
+                                mins = int(m.group(1))
+                                if "h" in m.group(2) or "hora" in m.group(2):
+                                    mins *= 60
+
                             agora2 = datetime.now(FUSO_BR)
                             snooze_until = agora2 + timedelta(minutes=mins)
-
                             tarefas[idx]["snoozed_until"] = format_dt(snooze_until)
                             tarefas[idx]["next_remind_at"] = tarefas[idx]["snoozed_until"]
                             salvar_tarefas(tarefas)
-
                             msg = f"⏳ Adiei por {mins} min: **{tarefas[idx]['descricao']}**."
                             st.success(msg)
                             st.session_state.memoria_v3.append({"role": "assistant", "content": msg})
                             st.rerun()
 
-            # -------- AGENDAR --------
-            elif intencao == "AGENDAR":
-                d = extrair_dados_tarefa(texto)
-                if d:
-                    d = normalizar_tarefa(d)
-                    tarefas.append(d)
-                    salvar_tarefas(tarefas)
-
-                    msg = f"📌 Agendado: **{d['descricao']}** às **{d['data_hora'].split(' ')[1]}**."
-                    st.success(msg)
-                    st.session_state.memoria_v3.append({"role": "assistant", "content": msg})
-                    st.rerun()
-                else:
-                    msg = "Não consegui extrair tarefa e horário. Ex: 'me lembra de abrir a HL às 19:13'."
-                    st.warning(msg)
-                    st.session_state.memoria_v3.append({"role": "assistant", "content": msg})
-
-            # -------- BUSCAR --------
             elif intencao == "BUSCAR":
                 web = buscar_tavily(texto)
                 if web:
@@ -526,7 +530,6 @@ with col_main:
                         messages=[{"role": "user", "content": f"Dados: {web}\nPergunta: {texto}"}],
                         temperature=0.2
                     ).choices[0].message.content
-
                     st.markdown(resp)
                     st.session_state.memoria_v3.append({"role": "assistant", "content": resp})
                 else:
@@ -534,7 +537,6 @@ with col_main:
                     st.warning(msg)
                     st.session_state.memoria_v3.append({"role": "assistant", "content": msg})
 
-            # -------- CONVERSA --------
             else:
                 msgs = [{"role": "system", "content": "Você é uma assistente útil, direta e amigável. Responda em pt-BR."}]
                 for m in st.session_state.memoria_v3:
