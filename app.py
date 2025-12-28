@@ -7,7 +7,7 @@ import json
 import os
 import time
 from datetime import datetime
-from zoneinfo import ZoneInfo # Importante para o horário do Brasil
+from zoneinfo import ZoneInfo # Biblioteca de Fuso Horário
 
 # --- 1. Configuração ---
 st.set_page_config(page_title="Jarvis BR", page_icon="🇧🇷")
@@ -23,8 +23,7 @@ except:
 
 MODEL_ID = "llama-3.3-70b-versatile"
 ARQUIVO_TAREFAS = "tarefas.json"
-# Configura o fuso horário para São Paulo/Brasília
-FUSO_BR = ZoneInfo("America/Sao_Paulo")
+FUSO_BR = ZoneInfo("America/Sao_Paulo") # Fuso Horário Oficial
 
 # --- 3. Memória ---
 if "memoria_v3" not in st.session_state:
@@ -32,7 +31,6 @@ if "memoria_v3" not in st.session_state:
 if "ultimo_audio" not in st.session_state:
     st.session_state.ultimo_audio = None
 if "ultima_cobranca" not in st.session_state:
-    # Começa no passado para permitir cobrança imediata
     st.session_state.ultima_cobranca = datetime.min.replace(tzinfo=FUSO_BR)
 
 def carregar_tarefas():
@@ -46,12 +44,17 @@ def salvar_tarefas(lista):
 
 # --- FUNÇÕES INTELIGENTES ---
 def identificar_intencao(texto):
-    if any(x in texto.lower() for x in ["lembrar", "agendar", "anotar", "marcar", "cobrar"]): return "AGENDAR"
-    if any(x in texto.lower() for x in ["hoje", "preço", "notícia", "valor", "dólar"]): return "BUSCAR"
+    texto = texto.lower()
+    # CORREÇÃO: Usamos partes das palavras para pegar "lembre", "lembrar", "lembra"
+    palavras_chave_agenda = ["lembr", "agend", "anota", "marca", "cobr", "avis"]
+    
+    if any(p in texto for p in palavras_chave_agenda): 
+        return "AGENDAR"
+    if any(x in texto for x in ["hoje", "preço", "notícia", "valor", "dólar", "tempo"]): 
+        return "BUSCAR"
     return "RESPONDER"
 
 def extrair_dados_tarefa(texto):
-    # Passa a hora certa para a IA
     agora_br = datetime.now(FUSO_BR).strftime("%Y-%m-%d %H:%M")
     prompt = f"""
     Estamos no Brasil. Agora é: {agora_br}.
@@ -82,38 +85,30 @@ col_main, col_agenda = st.columns([0.7, 0.3])
 
 # --- O VIGIA (Com Fuso Correto) ---
 tarefas = carregar_tarefas()
-agora = datetime.now(FUSO_BR) # Pega a hora do Brasil
+agora = datetime.now(FUSO_BR)
 mensagem_cobranca = None
 
 for t in tarefas:
     try:
-        # Converte a data da tarefa para ter fuso horário
         data_tarefa = datetime.strptime(t['data_hora'], "%Y-%m-%d %H:%M").replace(tzinfo=FUSO_BR)
-        
-        # Verifica atraso
         tempo_desde_ultima = (agora - st.session_state.ultima_cobranca).total_seconds()
         
-        # Se passou da hora E faz mais de 2 minutos que não cobra
+        # Cobra se passou da hora e faz mais de 2 minutos que não fala
         if agora > data_tarefa and tempo_desde_ultima > 120:
             mensagem_cobranca = f"Ei! Já são {agora.strftime('%H:%M')} e a tarefa '{t['descricao']}' venceu às {t['data_hora'].split(' ')[1]}. Já fez?"
             st.session_state.ultima_cobranca = agora
             break
-    except:
-        pass
+    except: pass
 
 if mensagem_cobranca:
     st.error(mensagem_cobranca, icon="🚨")
-    # Adiciona aviso no chat
     st.session_state.memoria_v3.append({"role": "assistant", "content": "🚨 " + mensagem_cobranca})
-    
-    # Toca o áudio (A linha que estava quebrada foi corrigida aqui)
     arquivo_bronca = asyncio.run(falar(mensagem_cobranca))
     st.audio(arquivo_bronca, format="audio/mp3", autoplay=True)
 
 # --- EXIBIÇÃO ---
 with col_agenda:
     st.subheader("📌 Agenda")
-    # Relógio para você conferir se está batendo com o seu
     st.caption(f"🕒 Hora Brasil: {agora.strftime('%H:%M:%S')}")
     
     if tarefas:
@@ -179,7 +174,8 @@ with col_main:
                 st.session_state.memoria_v3.append({"role": "assistant", "content": resp})
                 if usou_voz:
                     mp3 = asyncio.run(falar(resp))
-                    st.audio(mp3, format="audio/mp3", autoplay=True) # Linha corrigida aqui também
+                    # AQUI ESTAVA O ERRO, AGORA ESTÁ CORRIGIDO:
+                    st.audio(mp3, format="audio/mp3", autoplay=True)
 
 # Loop de Vigília (10 segundos)
 time.sleep(10)
