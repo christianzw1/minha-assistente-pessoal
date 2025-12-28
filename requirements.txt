@@ -1,6 +1,5 @@
 streamlit
 groq
-edge-tts
-asyncio
 tavily-python
+edge-tts
 streamlit-autorefresh
