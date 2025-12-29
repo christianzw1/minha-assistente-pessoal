@@ -438,24 +438,52 @@ def extrair_dados_tarefa(texto: str):
 def router_llm(texto: str, tarefas: list) -> dict:
     agora = format_dt(now_floor_minute())
     resumo_tarefas = "\n".join([f"{i}: {t['descricao']}" for i, t in enumerate(tarefas)])
-    prompt = f"""
-    Agora: {agora}.
-    Tarefas: {resumo_tarefas}
-    Msg: "{texto}"
     
-    Classifique em JSON:
-    Action: TASK_CREATE | TASK_DONE | TASK_SNOOZE | TASK_SILENCE | WEB_SEARCH | CHAT
-    task_index: ID numérico se houver
-    minutes: int se houver
-    search_query: string se houver
+    # Prompt corrigido para forçar chaves exatas (minúsculas)
+    prompt = f"""
+    Agora é {agora}.
+    Tarefas pendentes:
+    {resumo_tarefas}
+    
+    Mensagem do usuário: "{texto}"
+    
+    Analise a intenção e responda APENAS o JSON abaixo preenchido, sem explicações:
+    {{
+      "action": "TASK_CREATE" ou "TASK_DONE" ou "TASK_SNOOZE" ou "TASK_SILENCE" ou "WEB_SEARCH" ou "CHAT",
+      "task_index": (número da tarefa ou -1),
+      "minutes": (minutos para adiar ou 0),
+      "search_query": (termo de busca ou "")
+    }}
     """
+    
+    default_response = {"action": "CHAT", "task_index": -1, "minutes": 0, "search_query": ""}
+    
     try:
         resp = client.chat.completions.create(
             model=MODEL_ID, messages=[{"role": "user", "content": prompt}], temperature=0
         )
         raw = resp.choices[0].message.content
-        return json.loads(re.search(r"\{.*\}", raw, re.DOTALL).group(0))
-    except: return {"action": "CHAT", "task_index": -1}
+        
+        # Tenta extrair o JSON da resposta
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if match:
+            data = json.loads(match.group(0))
+            
+            # CORREÇÃO DE SEGURANÇA: Garante que a chave 'action' existe e é minúscula
+            if "Action" in data and "action" not in data:
+                data["action"] = data["Action"]
+            
+            # Garante que sempre tem uma action válida, senão vira CHAT
+            if "action" not in data:
+                data["action"] = "CHAT"
+                
+            return data
+        else:
+            return default_response
+            
+    except Exception as e:
+        # Se der qualquer erro (JSON inválido, API fora), cai pro Chat normal
+        return default_response
 
 def decidir_acao(texto: str, tarefas: list) -> dict:
     t = limpar_texto(texto)
