@@ -3,3 +3,4 @@ groq
 tavily-python
 edge-tts
 streamlit-autorefresh
+requests
