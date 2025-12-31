@@ -1,3 +1,4 @@
+
 import streamlit as st
 import streamlit.components.v1 as components
 from groq import Groq
@@ -63,6 +64,211 @@ QUIET_START = 22
 QUIET_END = 7
 
 AUTO_REFRESH_MS = 10_000  # 10s
+# =========================
+# ROTINAS (BRIEFING / LEMBRETES / FECHAMENTO)
+# =========================
+SETTINGS_PATH = "miga_settings.json"
+DAILY_STATE_PATH = "miga_daily_state.json"
+
+DEFAULT_SETTINGS = {
+    "city_name": "Ilhéus, BA",
+    "lat": None,
+    "lon": None,
+    "briefing_enabled": True,
+    "briefing_time": "07:00",
+    "smart_enabled": True,
+    "leave_time": "07:20",          # horário típico de sair (pra lembrete de chuva)
+    "rain_threshold": 60,           # % chance de chuva pra lembrar guarda-chuva
+    "heat_threshold": 30,           # °C pra lembrete de água
+    "closing_enabled": True,
+    "closing_time": "21:30",
+}
+
+def load_settings() -> dict:
+    if not os.path.exists(SETTINGS_PATH):
+        return dict(DEFAULT_SETTINGS)
+    try:
+        data = json.loads(open(SETTINGS_PATH, "r", encoding="utf-8").read() or "{}")
+        if not isinstance(data, dict):
+            return dict(DEFAULT_SETTINGS)
+        merged = dict(DEFAULT_SETTINGS)
+        merged.update(data)
+        return merged
+    except Exception:
+        return dict(DEFAULT_SETTINGS)
+
+def save_settings(s: dict) -> None:
+    try:
+        tmp = SETTINGS_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(s, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, SETTINGS_PATH)
+    except Exception:
+        pass
+
+def load_daily_state() -> dict:
+    if not os.path.exists(DAILY_STATE_PATH):
+        return {}
+    try:
+        data = json.loads(open(DAILY_STATE_PATH, "r", encoding="utf-8").read() or "{}")
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def save_daily_state(s: dict) -> None:
+    try:
+        tmp = DAILY_STATE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(s, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, DAILY_STATE_PATH)
+    except Exception:
+        pass
+
+def parse_hhmm(hhmm: str) -> Optional[tuple]:
+    try:
+        hhmm = (hhmm or "").strip()
+        m = re.match(r"^(\d{1,2}):(\d{2})$", hhmm)
+        if not m:
+            return None
+        h = max(0, min(23, int(m.group(1))))
+        mi = max(0, min(59, int(m.group(2))))
+        return (h, mi)
+    except Exception:
+        return None
+
+def same_minute(dt: datetime, hhmm: str) -> bool:
+    p = parse_hhmm(hhmm)
+    if not p:
+        return False
+    return dt.hour == p[0] and dt.minute == p[1]
+
+def today_key(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d")
+
+def geocode_city(city_name: str) -> Optional[dict]:
+    """Resolve cidade -> lat/lon usando Open-Meteo Geocoding (sem chave)."""
+    try:
+        q = (city_name or "").strip()
+        if not q:
+            return None
+        url = "https://geocoding-api.open-meteo.com/v1/search"
+        r = requests.get(url, params={"name": q, "count": 1, "language": "pt", "format": "json"}, timeout=6)
+        j = r.json()
+        results = j.get("results") or []
+        if not results:
+            return None
+        top = results[0]
+        return {
+            "name": top.get("name"),
+            "admin1": top.get("admin1"),
+            "country": top.get("country"),
+            "lat": top.get("latitude"),
+            "lon": top.get("longitude"),
+        }
+    except Exception:
+        return None
+
+def fetch_weather(lat: float, lon: float) -> Optional[dict]:
+    """Clima de hoje + agora via Open-Meteo (sem chave)."""
+    try:
+        url = "https://api.open-meteo.com/v1/forecast"
+        params = {
+            "latitude": lat,
+            "longitude": lon,
+            "current": "temperature_2m,is_day,precipitation,weather_code,wind_speed_10m",
+            "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max,precipitation_sum",
+            "timezone": "America/Sao_Paulo",
+            "forecast_days": 1,
+        }
+        r = requests.get(url, params=params, timeout=6)
+        j = r.json()
+
+        cur = j.get("current") or {}
+        daily = j.get("daily") or {}
+
+        def first(arr, default=None):
+            try:
+                return (arr or [default])[0]
+            except Exception:
+                return default
+
+        out = {
+            "temp_now": cur.get("temperature_2m"),
+            "wind": cur.get("wind_speed_10m"),
+            "temp_max": first(daily.get("temperature_2m_max")),
+            "temp_min": first(daily.get("temperature_2m_min")),
+            "rain_prob": first(daily.get("precipitation_probability_max")),
+            "rain_sum": first(daily.get("precipitation_sum")),
+        }
+        return out
+    except Exception:
+        return None
+
+def tasks_today_summary(tarefas: list, dt: datetime) -> dict:
+    day = today_key(dt)
+    active = [t for t in tarefas if t.get("status") != "silenciada"]
+    todays = [t for t in active if (t.get("data_hora","").startswith(day))]
+    # ordena pelas próximas
+    todays_sorted = sorted(todays, key=lambda x: x.get("data_hora",""))
+    next3 = todays_sorted[:3]
+    return {"count": len(todays_sorted), "next": next3}
+
+def build_briefing(settings: dict, tarefas: list, dt: datetime) -> str:
+    city = settings.get("city_name") or "sua cidade"
+    w = None
+    if settings.get("lat") is not None and settings.get("lon") is not None:
+        w = fetch_weather(settings["lat"], settings["lon"])
+    ts = tasks_today_summary(tarefas, dt)
+
+    header = f"☀️ **Briefing Matinal** — {dt.strftime('%d/%m/%Y')}\n📍 *{city}*"
+    parts = [header]
+
+    if w:
+        rain_prob = w.get("rain_prob")
+        tmin = w.get("temp_min")
+        tmax = w.get("temp_max")
+        temp_now = w.get("temp_now")
+
+        chuva_txt = "🌧️" if (isinstance(rain_prob, (int, float)) and rain_prob >= 50) else "🌤️"
+        rp_txt = f"{int(rain_prob)}%" if isinstance(rain_prob, (int, float)) else "?"
+        now_txt = f"{round(temp_now)}°C" if isinstance(temp_now, (int, float)) else "?"
+        min_txt = f"{round(tmin)}°C" if isinstance(tmin, (int, float)) else "?"
+        max_txt = f"{round(tmax)}°C" if isinstance(tmax, (int, float)) else "?"
+
+        parts.append(f"\n{chuva_txt} **Clima hoje:** {min_txt}–{max_txt} | agora {now_txt} | chuva **{rp_txt}**")
+        if isinstance(rain_prob, (int, float)) and rain_prob >= int(settings.get("rain_threshold", 60)):
+            parts.append("☂️ *Dica rápida:* chance alta de chuva — guarda-chuva/jaqueta podem salvar teu dia.")
+        if isinstance(tmax, (int, float)) and tmax >= int(settings.get("heat_threshold", 30)):
+            parts.append("💧 *Dica rápida:* calor forte hoje — água e protetor valem ouro.")
+
+    # tarefas
+    parts.append(f"\n📌 **Hoje:** {ts['count']} tarefa(s) na agenda.")
+    if ts["next"]:
+        lines = []
+        for t in ts["next"]:
+            try:
+                hhmm = (t.get("data_hora","")[-5:])
+            except Exception:
+                hhmm = ""
+            lines.append(f"• **{hhmm}** — {t.get('descricao','')}")
+        parts.append("\n".join(lines))
+    else:
+        parts.append("• Nada marcado — dia livre pra atacar um objetivo grande 😄")
+
+    # foco do dia (simples, sem inventar demais)
+    foco = ts["next"][0]["descricao"] if ts["next"] else "fazer 1 coisa que empurre tua vida pra frente"
+    parts.append(f"\n🎯 **Foco do dia:** {foco}")
+
+    return "\n".join(parts).strip()
+
+def build_closing_prompt(dt: datetime) -> str:
+    return (
+        f"🌙 **Fechamento do dia** ({dt.strftime('%d/%m')})\n"
+        "Manda em 1–3 linhas:\n"
+        "1) O que você fez hoje?\n"
+        "2) O que ficou pendente?\n"
+        "3) Leve / normal / pesado?"
+    )
 
 
 # =========================
@@ -416,6 +622,21 @@ if "pending_input" not in st.session_state:
     st.session_state.pending_input = None
 if "pending_usou_voz" not in st.session_state:
     st.session_state.pending_usou_voz = False
+
+
+# Rotinas: estado diário / dedupe
+if "settings" not in st.session_state:
+    st.session_state.settings = load_settings()
+if "daily_state" not in st.session_state:
+    st.session_state.daily_state = load_daily_state()
+if "briefing_sent" not in st.session_state:
+    st.session_state.briefing_sent = st.session_state.daily_state.get("briefing_sent")  # YYYY-MM-DD ou None
+if "closing_sent" not in st.session_state:
+    st.session_state.closing_sent = st.session_state.daily_state.get("closing_sent")    # YYYY-MM-DD ou None
+if "smart_flags" not in st.session_state:
+    st.session_state.smart_flags = st.session_state.daily_state.get("smart_flags", {})  # dict
+if "awaiting_closing" not in st.session_state:
+    st.session_state.awaiting_closing = bool(st.session_state.daily_state.get("awaiting_closing", False))
 
 
 # =========================
@@ -824,6 +1045,74 @@ agora = now_floor_minute()
 tarefas = [normalizar_tarefa(t) for t in carregar_tarefas()]
 salvar_tarefas(tarefas)
 
+# =========================
+# ROTINAS PROATIVAS (sem mexer no seu sistema de tarefas)
+# =========================
+settings = st.session_state.settings
+daily_state = st.session_state.daily_state
+today = today_key(agora)
+
+# 1) Briefing matinal (uma vez por dia)
+if settings.get("briefing_enabled", True) and not em_horario_silencioso(agora) and same_minute(agora, settings.get("briefing_time","07:00")):
+    if st.session_state.briefing_sent != today:
+        msg = build_briefing(settings, tarefas, agora)
+        enviar_telegram(msg)
+        browser_notify("Briefing Matinal", "Te mandei o briefing do dia ✅")
+        add_event("briefing", msg)
+        st.session_state.briefing_sent = today
+        daily_state["briefing_sent"] = today
+        save_daily_state(daily_state)
+
+# 2) Lembretes inteligentes (clima) — sem duplicar com tarefas
+if settings.get("smart_enabled", True) and not em_horario_silencioso(agora):
+    # tenta pegar clima se tiver lat/lon
+    w = None
+    if settings.get("lat") is not None and settings.get("lon") is not None:
+        w = fetch_weather(settings["lat"], settings["lon"])
+
+    flags = dict(st.session_state.smart_flags or {})
+    flags.setdefault(today, {})
+
+    if w:
+        rain_prob = w.get("rain_prob")
+        tmax = w.get("temp_max")
+
+        # Guarda-chuva no horário de sair
+        if isinstance(rain_prob, (int, float)) and rain_prob >= int(settings.get("rain_threshold", 60)):
+            if same_minute(agora, settings.get("leave_time","07:20")) and not flags[today].get("umbrella"):
+                m = f"☂️ Chuva forte na previsão hoje ({int(rain_prob)}%). Se for sair agora, leva guarda-chuva/jaqueta 😄"
+                enviar_telegram(m)
+                browser_notify("Lembrete (clima)", "Chance alta de chuva — guarda-chuva!")
+                add_event("smart_reminder", m)
+                flags[today]["umbrella"] = True
+
+        # Hidratação ao meio-dia se calor
+        if isinstance(tmax, (int, float)) and tmax >= int(settings.get("heat_threshold", 30)):
+            if same_minute(agora, "12:00") and not flags[today].get("water"):
+                m = f"💧 Hoje tá pra {round(tmax)}°C. Água agora = menos sofrimento depois 😅"
+                enviar_telegram(m)
+                browser_notify("Lembrete (saúde)", "Calor forte — água!")
+                add_event("smart_reminder", m)
+                flags[today]["water"] = True
+
+    st.session_state.smart_flags = flags
+    daily_state["smart_flags"] = flags
+    save_daily_state(daily_state)
+
+# 3) Fechamento diário (uma vez por dia)
+if settings.get("closing_enabled", True) and same_minute(agora, settings.get("closing_time","21:30")):
+    if st.session_state.closing_sent != today:
+        m = build_closing_prompt(agora)
+        enviar_telegram(m)
+        browser_notify("Fechamento do dia", "Me conta rapidinho como foi seu dia ✅")
+        add_event("closing_prompt", m)
+        st.session_state.closing_sent = today
+        st.session_state.awaiting_closing = True
+        daily_state["closing_sent"] = today
+        daily_state["awaiting_closing"] = True
+        save_daily_state(daily_state)
+
+
 tarefa_alertada = pick_due_task(tarefas, agora)
 if tarefa_alertada:
     next_at = tarefa_alertada.get("next_remind_at") or tarefa_alertada.get("data_hora")
@@ -892,6 +1181,55 @@ with st.sidebar:
     if st.session_state.last_audio_bytes:
         st.caption("Último áudio (TTS)")
         st.audio(st.session_state.last_audio_bytes, format="audio/mp3")
+
+
+# =========================
+# ROTINAS: Briefing / Lembretes / Fechamento
+# =========================
+st.markdown("### 🗓️ Rotinas")
+with st.expander("Configurar briefing, lembretes e fechamento", expanded=False):
+    s = dict(st.session_state.settings)
+
+    s["city_name"] = st.text_input("Cidade (para clima)", value=s.get("city_name","Ilhéus, BA"))
+    c1, c2 = st.columns(2)
+    with c1:
+        s["briefing_enabled"] = st.toggle("Briefing matinal", value=bool(s.get("briefing_enabled", True)))
+        s["briefing_time"] = st.text_input("Horário do briefing (HH:MM)", value=s.get("briefing_time","07:00"))
+    with c2:
+        s["closing_enabled"] = st.toggle("Fechamento diário", value=bool(s.get("closing_enabled", True)))
+        s["closing_time"] = st.text_input("Horário do fechamento (HH:MM)", value=s.get("closing_time","21:30"))
+
+    st.divider()
+    s["smart_enabled"] = st.toggle("Lembretes inteligentes (clima)", value=bool(s.get("smart_enabled", True)))
+    c3, c4, c5 = st.columns(3)
+    with c3:
+        s["leave_time"] = st.text_input("Horário típico de sair (HH:MM)", value=s.get("leave_time","07:20"))
+    with c4:
+        s["rain_threshold"] = st.number_input("Chuva (%) pra lembrar", min_value=10, max_value=100, value=int(s.get("rain_threshold",60)), step=5)
+    with c5:
+        s["heat_threshold"] = st.number_input("Calor (°C) pra lembrar água", min_value=20, max_value=45, value=int(s.get("heat_threshold",30)), step=1)
+
+    st.divider()
+    geo_col1, geo_col2 = st.columns([1,1])
+    with geo_col1:
+        if st.button("📍 Atualizar localização da cidade", use_container_width=True):
+            g = geocode_city(s["city_name"])
+            if g and g.get("lat") is not None and g.get("lon") is not None:
+                s["lat"] = float(g["lat"])
+                s["lon"] = float(g["lon"])
+                st.toast(f"Localização ok: {g.get('name','')} ({s['lat']:.3f}, {s['lon']:.3f})")
+            else:
+                st.toast("Não consegui achar essa cidade 😅 Tenta: 'Ilhéus, BA' ou 'Salvador, BA'")
+    with geo_col2:
+        if st.button("💾 Salvar rotinas", use_container_width=True):
+            st.session_state.settings = dict(s)
+            save_settings(st.session_state.settings)
+            st.toast("Configurações salvas ✅")
+
+    if s.get("lat") is not None and s.get("lon") is not None:
+        st.caption(f"Lat/Lon: {float(s['lat']):.3f}, {float(s['lon']):.3f}")
+    else:
+        st.caption("Lat/Lon: (não configurado) — clique em “Atualizar localização”.")
 
     st.divider()
     st.markdown("### 📌 Agenda")
@@ -1013,8 +1351,33 @@ if st.session_state.pending_input:
     tarefas = [normalizar_tarefa(t) for t in carregar_tarefas()]
     salvar_tarefas(tarefas)
 
-    web_used = False
-    resp_txt = ""
+
+web_used = False
+resp_txt = ""
+
+# =========================
+# FECHAMENTO DIÁRIO (captura resposta do usuário)
+# =========================
+if user_txt.strip().lower().startswith("/fechamento"):
+    st.session_state.awaiting_closing = True
+    st.session_state.daily_state["awaiting_closing"] = True
+    save_daily_state(st.session_state.daily_state)
+    resp_txt = build_closing_prompt(now_floor_minute())
+    st.session_state.memoria.append({"role": "assistant", "content": resp_txt})
+    add_event("closing_prompt_manual", resp_txt)
+    st.rerun()
+
+if st.session_state.awaiting_closing and not user_txt.strip().startswith("/"):
+    # Trata essa mensagem como resposta do fechamento (sem passar pelo router)
+    add_event("daily_review", user_txt)
+    update_summary_with_llm(f"Fechamento do dia: {user_txt}")
+    st.session_state.awaiting_closing = False
+    st.session_state.daily_state["awaiting_closing"] = False
+    save_daily_state(st.session_state.daily_state)
+    resp_txt = "Fechou 😄 Registrei teu fechamento de hoje. Amanhã eu já ajusto o teu briefing/lembretes com base nisso."
+    st.session_state.memoria.append({"role": "assistant", "content": resp_txt})
+    add_event("chat_assistant", resp_txt)
+    st.rerun()
 
     with st.spinner(f"{ASSISTANT_NAME} tá pensando..."):
         acao = decidir_acao(user_txt, tarefas)
