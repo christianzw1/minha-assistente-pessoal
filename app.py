@@ -1124,14 +1124,183 @@ Responda APENAS o JSON:
     except Exception:
         return default_response
 
-def decidir_acao(texto: str, tarefas: list) -> dict:
-    t = limpar_texto(texto)
-    if t.startswith("/web "):
-        return {"action": "WEB_SEARCH", "search_query": str(texto)[5:]}
-    if t.startswith("/chat "):
+def parse_slash_command(raw: str) -> Optional[dict]:
+    """
+    Comandos começando com '/' NÃO podem passar por limpar_texto (que remove '/').
+    Aceita: /web <consulta>  |  /web  (sem consulta)  |  /chat
+    """
+    s = (raw or "").strip()
+    m = re.match(r"^/(web|chat)\b\s*(.*)$", s, flags=re.IGNORECASE)
+    if not m:
+        return None
+    cmd = (m.group(1) or "").lower()
+    arg = (m.group(2) or "").strip()
+    if cmd == "web":
+        return {"action": "WEB_SEARCH", "search_query": arg}
+    if cmd == "chat":
         return {"action": "CHAT"}
-    if any(x in t for x in ["cotação", "preço", "clima", "noticia", "notícia", "quem ganhou", "resultado", "últimas", "atualização"]):
+    return None
+
+
+def detect_weather_request(raw: str, settings: dict) -> Optional[dict]:
+    """
+    Detecta pedidos de clima/previsão e responde via Open‑Meteo (sem depender de busca/LLM).
+    - Se o usuário não disser a cidade, usa settings['city_name'].
+    - Entende 'amanhã'.
+    """
+    t = limpar_texto(raw)
+
+    # Evita falso positivo com "tempo" em outros contextos.
+    is_weather = any(k in t for k in ["previsao do tempo", "previsão do tempo", "clima", "temperatura", "vai chover", "chuva"])
+    if not is_weather:
+        # 'tempo' sozinho é ambíguo; só aceita se vier junto de pista meteorológica.
+        if "tempo" not in t or not any(x in t for x in ["previs", "chuva", "temperatur", "clima"]):
+            return None
+
+    day_offset = 1 if any(x in t for x in ["amanha", "amanhã"]) else 0
+
+    # Tentativa leve de extrair cidade no final da frase: "em X", "para X", "no X", "na X"
+    city = None
+    m = re.search(r"(?:\bem\b|\bpara\b|\bpra\b|\bno\b|\bna\b)\s+([a-zà-ÿ0-9\s\-\.,]+)$", t, flags=re.IGNORECASE)
+    if m:
+        city = (m.group(1) or "").strip()
+        city = re.sub(r"\b(hoje|amanha|amanhã)\b", "", city).strip(" ,.-")
+        if len(city) < 2:
+            city = None
+
+    if not city:
+        city = (settings or {}).get("city_name") or "Ilhéus, BA"
+
+    return {"action": "WEATHER", "city": city, "day_offset": day_offset}
+
+
+def fetch_weather_days(lat: float, lon: float, days: int = 2) -> Optional[dict]:
+    """Clima de hoje + próximos dias via Open‑Meteo (sem chave)."""
+    try:
+        days = max(1, min(7, int(days)))
+        url = "https://api.open-meteo.com/v1/forecast"
+        params = {
+            "latitude": lat,
+            "longitude": lon,
+            "current": "temperature_2m,is_day,precipitation,weather_code,wind_speed_10m",
+            "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max,precipitation_sum",
+            "timezone": "America/Sao_Paulo",
+            "forecast_days": days,
+        }
+        r = requests.get(url, params=params, timeout=6)
+        j = r.json()
+        cur = j.get("current") or {}
+        daily = j.get("daily") or {}
+
+        return {
+            "current": {
+                "temp_now": cur.get("temperature_2m"),
+                "wind": cur.get("wind_speed_10m"),
+            },
+            "dates": daily.get("time") or [],
+            "temp_max": daily.get("temperature_2m_max") or [],
+            "temp_min": daily.get("temperature_2m_min") or [],
+            "rain_prob": daily.get("precipitation_probability_max") or [],
+            "rain_sum": daily.get("precipitation_sum") or [],
+        }
+    except Exception:
+        return None
+
+
+def resolve_city_coords(settings: dict, city: str) -> Optional[dict]:
+    """
+    Resolve cidade -> coords.
+    Se bater com a cidade padrão e já tiver lat/lon, reaproveita.
+    """
+    s_city = (settings or {}).get("city_name") or ""
+    s_lat = (settings or {}).get("lat")
+    s_lon = (settings or {}).get("lon")
+
+    if city and s_city and city.strip().lower() == s_city.strip().lower() and s_lat is not None and s_lon is not None:
+        return {"city": s_city, "lat": float(s_lat), "lon": float(s_lon)}
+
+    g = geocode_city(city)
+    if not g:
+        return None
+    display = g.get("name") or city
+    admin1 = g.get("admin1")
+    if admin1 and admin1 not in display:
+        display = f"{display}, {admin1}"
+    return {"city": display, "lat": float(g["lat"]), "lon": float(g["lon"])}
+
+
+def format_weather_reply(city_display: str, w: dict, day_offset: int) -> str:
+    """Formata uma resposta curta e estável."""
+    try:
+        idx = max(0, min(len(w.get("dates", [])) - 1, int(day_offset)))
+    except Exception:
+        idx = 0
+
+    def pick(arr, i):
+        try:
+            return arr[i]
+        except Exception:
+            return None
+
+    date_str = pick(w.get("dates", []), idx)
+    tmin = pick(w.get("temp_min", []), idx)
+    tmax = pick(w.get("temp_max", []), idx)
+    rp = pick(w.get("rain_prob", []), idx)
+    rsum = pick(w.get("rain_sum", []), idx)
+    now_temp = (w.get("current") or {}).get("temp_now")
+
+    label = "Amanhã" if idx == 1 else "Hoje"
+    d_txt = ""
+    try:
+        if date_str:
+            d = datetime.fromisoformat(str(date_str))
+            d_txt = f" ({d.strftime('%d/%m')})"
+    except Exception:
+        d_txt = ""
+
+    def fmt_c(v):
+        return f"{round(v)}°C" if isinstance(v, (int, float)) else "?"
+    def fmt_pct(v):
+        return f"{int(v)}%" if isinstance(v, (int, float)) else "?"
+    def fmt_mm(v):
+        return f"{round(v, 1)}mm" if isinstance(v, (int, float)) else "?"
+
+    line1 = f"🌦️ **{label}{d_txt} em {city_display}:** {fmt_c(tmin)}–{fmt_c(tmax)} | chance de chuva **{fmt_pct(rp)}**"
+    extras = []
+    if isinstance(now_temp, (int, float)) and idx == 0:
+        extras.append(f"agora {fmt_c(now_temp)}")
+    if isinstance(rsum, (int, float)):
+        extras.append(f"chuva acumulada {fmt_mm(rsum)}")
+
+    if extras:
+        line1 += " (" + " | ".join(extras) + ")"
+
+    # dica simples
+    if isinstance(rp, (int, float)) and rp >= 60:
+        line1 += "\n☂️ Leva guarda-chuva pra não tomar prejuízo 😄"
+    elif isinstance(tmax, (int, float)) and tmax >= 30:
+        line1 += "\n💧 Vai estar quente — água e protetor ajudam demais."
+
+    return line1
+
+
+def decidir_acao(texto: str, tarefas: list, settings: dict) -> dict:
+    # 0) comandos slash primeiro (sem limpar_texto)
+    cmd = parse_slash_command(texto)
+    if cmd:
+        return cmd
+
+    # 1) clima via API (sem web/LLM)
+    wreq = detect_weather_request(texto, settings)
+    if wreq:
+        return wreq
+
+    # 2) heurística simples de coisas que pedem web
+    t = limpar_texto(texto)
+    if any(x in t for x in ["cotação", "preço", "noticia", "notícia", "quem ganhou", "resultado", "últimas", "atualização"]):
         return {"action": "WEB_SEARCH", "search_query": texto}
+
+    # 3) fallback: roteador via LLM
     return router_llm(texto, tarefas)
 
 
@@ -1505,6 +1674,8 @@ for m in st.session_state.memoria[-24:]:
         # Mensagem pequena abaixo quando realmente usou web
         if m.get("web_used"):
             st.caption("🔎 Usei busca na web pra responder.")
+        if m.get("weather_used"):
+            st.caption("🌦️ Usei previsão do Open‑Meteo pra responder.")
 
 
 # =========================
@@ -1556,6 +1727,7 @@ if st.session_state.pending_input:
 
 
 web_used = False
+weather_used = False
 resp_txt = ""
 
 # =========================
@@ -1597,7 +1769,7 @@ if user_txt:
             st.rerun()
 
         with st.spinner(f"{ASSISTANT_NAME} tá pensando..."):
-            acao = decidir_acao(user_txt, tarefas)
+            acao = decidir_acao(user_txt, tarefas, settings)
 
             if acao.get("action") == "TASK_CREATE":
                 d = extrair_dados_tarefa(user_txt)
@@ -1613,9 +1785,19 @@ if user_txt:
 
             elif acao.get("action") == "WEB_SEARCH":
                 web_used = True
-                q = acao.get("search_query") or user_txt
-                res = buscar_tavily(q)
-                prompt_web = f"""
+                q = (acao.get("search_query") or "").strip()
+
+                # Se o usuário digitou só "/web" (sem consulta), não faz busca vazia.
+                if not q:
+                    resp_txt = "Manda o que você quer pesquisar depois do **/web** 😄\nEx: `/web previsão do tempo em Ilhéus`"
+                    add_event("web_search", "Q: (vazio)")
+                else:
+                    st.session_state.last_web_query = q
+                    res = buscar_tavily(q)
+                    if not res:
+                        resp_txt = "Não consegui puxar resultados da web agora 😅 Tenta de novo."
+                    else:
+                        prompt_web = f"""
 {ZOE_PERSONA}
 
 Você recebeu resultados de busca na web (resuma e responda com base neles).
@@ -1627,14 +1809,38 @@ PERGUNTA DO USUÁRIO:
 
 Responda direto, do jeito da Zoe (curto, útil, com gíria leve/emoji na medida).
 """.strip()
+                        try:
+                            resp_txt = client.chat.completions.create(
+                                model=MODEL_ID,
+                                messages=[{"role": "user", "content": prompt_web}]
+                            ).choices[0].message.content
+                        except Exception:
+                            resp_txt = "Deu ruim pra consultar a web agora 😅 Tenta de novo daqui a pouquinho."
+                    add_event("web_search", f"Q: {q}")
+
+
+            elif acao.get("action") == "WEATHER":
+                weather_used = True
+                city_req = (acao.get("city") or (settings.get("city_name") if settings else "") or "Ilhéus, BA").strip()
+                info = resolve_city_coords(settings, city_req)
+                # Cache: se for a cidade padrão e ainda não tem coords, salva pra evitar geocode toda hora
                 try:
-                    resp_txt = client.chat.completions.create(
-                        model=MODEL_ID,
-                        messages=[{"role": "user", "content": prompt_web}]
-                    ).choices[0].message.content
+                    if info and settings and (settings.get("city_name","").strip().lower() == city_req.strip().lower()) and (settings.get("lat") is None or settings.get("lon") is None):
+                        settings["city_name"] = info["city"]
+                        settings["lat"] = info["lat"]
+                        settings["lon"] = info["lon"]
+                        save_settings(settings)
                 except Exception:
-                    resp_txt = "Deu ruim pra consultar a web agora 😅 Tenta de novo daqui a pouquinho."
-                add_event("web_search", f"Q: {q}")
+                    pass
+                if not info:
+                    resp_txt = f"Não consegui achar **{city_req}** 😅 Me diz no formato tipo: *Ilhéus, BA* ou *São Paulo, SP*."
+                else:
+                    w = fetch_weather_days(info["lat"], info["lon"], days=2)
+                    if not w:
+                        resp_txt = "Deu ruim pra puxar a previsão agora 😅 Tenta de novo já já."
+                    else:
+                        resp_txt = format_weather_reply(info["city"], w, int(acao.get("day_offset") or 0))
+                add_event("weather", f"{city_req} / d+{int(acao.get('day_offset') or 0)}")
 
             elif acao.get("action") == "TASK_DONE":
                 if tarefas:
@@ -1675,7 +1881,12 @@ Regras rápidas:
                 except Exception:
                     resp_txt = "Ops, deu um errinho pra gerar a resposta agora 😅 Tenta de novo?"
 
-        st.session_state.memoria.append({"role": "assistant", "content": resp_txt, **({"web_used": True} if web_used else {})})
+        meta_flags = {}
+        if web_used:
+            meta_flags["web_used"] = True
+        if weather_used:
+            meta_flags["weather_used"] = True
+        st.session_state.memoria.append({"role": "assistant", "content": resp_txt, **meta_flags})
         add_event("chat_assistant", resp_txt)
 
         # Se veio de voz, TTS curtinho (opcional)
