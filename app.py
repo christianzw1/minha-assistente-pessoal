@@ -9,6 +9,7 @@ import edge_tts
 import asyncio
 import json
 import os
+import tempfile
 import re
 import uuid
 import hashlib
@@ -708,6 +709,9 @@ if "last_input_time" not in st.session_state:
 if "last_audio_bytes" not in st.session_state:
     st.session_state.last_audio_bytes = None
 
+if "last_storage_error" not in st.session_state:
+    st.session_state.last_storage_error = ""
+
 if "pending_input" not in st.session_state:
     st.session_state.pending_input = None
 if "pending_usou_voz" not in st.session_state:
@@ -900,21 +904,56 @@ Devolva APENAS o resumo novo.
 # =========================
 # STORAGE TAREFAS
 # =========================
+def tarefas_path() -> str:
+    """Caminho absoluto para o arquivo de tarefas (evita surpresas com cwd)."""
+    return os.path.abspath(ARQUIVO_TAREFAS)
+
 def carregar_tarefas() -> list:
-    if not os.path.exists(ARQUIVO_TAREFAS):
+    path = tarefas_path()
+    if not os.path.exists(path):
         return []
     try:
-        with open(ARQUIVO_TAREFAS, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         return data if isinstance(data, list) else []
     except Exception:
         return []
 
 def salvar_tarefas(lista: list) -> None:
-    tmp = ARQUIVO_TAREFAS + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(lista, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, ARQUIVO_TAREFAS)
+    """
+    Escrita atômica e resistente a reruns do Streamlit.
+    Usa arquivo temporário *único* no mesmo diretório e faz os.replace().
+    Em caso de erro, não derruba o app: guarda o erro em st.session_state.last_storage_error.
+    """
+    path = tarefas_path()
+    base_dir = os.path.dirname(path) or "."
+    os.makedirs(base_dir, exist_ok=True)
+
+    tmp_path = ""
+    try:
+        # Temp único evita colisão quando o Streamlit dá rerun/autorefresh.
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", delete=False, dir=base_dir,
+            prefix=os.path.basename(path) + ".", suffix=".tmp"
+        ) as f:
+            json.dump(lista, f, ensure_ascii=False, indent=2)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+            tmp_path = f.name
+
+        os.replace(tmp_path, path)
+        st.session_state.last_storage_error = ""
+    except Exception as e:
+        # limpeza best-effort
+        try:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        st.session_state.last_storage_error = f"{type(e).__name__}: {e}"
 
 def limpar_texto(s: str) -> str:
     s = (s or "").lower()
@@ -1170,8 +1209,11 @@ def schedule_next(agora: datetime, t: dict) -> dict:
 st_autorefresh(interval=AUTO_REFRESH_MS, key="tick")
 
 agora = now_floor_minute()
-tarefas = [normalizar_tarefa(t) for t in carregar_tarefas()]
-salvar_tarefas(tarefas)
+_raw_tarefas = carregar_tarefas()
+tarefas = [normalizar_tarefa(t) for t in _raw_tarefas]
+# Regrava só se mudou (evita escrita desnecessária + reduz chance de colisão em reruns)
+if tarefas != _raw_tarefas or (not os.path.exists(tarefas_path())):
+    salvar_tarefas(tarefas)
 
 # =========================
 # ROTINAS PROATIVAS (sem mexer no seu sistema de tarefas)
@@ -1303,6 +1345,10 @@ with st.sidebar:
     st.caption(ASSISTANT_ONE_LINER)
     st.caption(f"🕒 {agora.strftime('%H:%M')} • {agora.strftime('%d/%m/%Y')}")
     st.divider()
+    # Aviso: se o arquivo de tarefas não puder ser gravado, o app continua — mas te avisa aqui
+    if st.session_state.get('last_storage_error'):
+        st.warning('Problema ao salvar tarefas: ' + st.session_state.last_storage_error)
+
 
     # ===== Avatar (Rebeca / qualquer imagem que você quiser) =====
     with st.expander("👤 Avatar", expanded=False):
