@@ -12,6 +12,7 @@ import os
 import re
 import uuid
 import hashlib
+import base64
 import time
 import sqlite3
 from datetime import datetime, timedelta
@@ -83,6 +84,7 @@ DEFAULT_SETTINGS = {
     "heat_threshold": 30,           # °C pra lembrete de água
     "closing_enabled": True,
     "closing_time": "21:30",
+    "avatar_path": "avatar.png",
 }
 
 def load_settings() -> dict:
@@ -106,6 +108,50 @@ def save_settings(s: dict) -> None:
         os.replace(tmp, SETTINGS_PATH)
     except Exception:
         pass
+
+
+def _avatar_guess_mime(path: str) -> str:
+    p = (path or "").lower()
+    if p.endswith(".jpg") or p.endswith(".jpeg"):
+        return "image/jpeg"
+    if p.endswith(".webp"):
+        return "image/webp"
+    return "image/png"
+
+def load_avatar_data_uri(settings: dict) -> Optional[str]:
+    """Carrega avatar do disco e devolve data-uri (pra usar no HTML)."""
+    try:
+        ap = (settings or {}).get("avatar_path") or "avatar.png"
+        if not os.path.exists(ap):
+            return None
+        data = open(ap, "rb").read()
+        if not data:
+            return None
+        mime = _avatar_guess_mime(ap)
+        b64 = base64.b64encode(data).decode("utf-8")
+        return f"data:{mime};base64,{b64}"
+    except Exception:
+        return None
+
+def save_uploaded_avatar(uploaded_file, settings: dict) -> dict:
+    """Salva o avatar enviado e atualiza settings['avatar_path']"""
+    if uploaded_file is None:
+        return settings
+    try:
+        fn = (uploaded_file.name or "").lower()
+        ext = ".png"
+        if fn.endswith(".jpg") or fn.endswith(".jpeg"):
+            ext = ".jpg"
+        elif fn.endswith(".webp"):
+            ext = ".webp"
+        out_path = "avatar" + ext
+        with open(out_path, "wb") as f:
+            f.write(uploaded_file.getvalue())
+        s = dict(settings or {})
+        s["avatar_path"] = out_path
+        return s
+    except Exception:
+        return settings
 
 def load_daily_state() -> dict:
     if not os.path.exists(DAILY_STATE_PATH):
@@ -299,19 +345,17 @@ def inject_css():
         .viewerBadge_container__1QSob { display:none !important; }
 
         :root{
-            --bg:#0b0f16;
-            --bg2:#0e1422;
+            --bg:#050607;
+            --bg2:#0a0b0d;
             --text: rgba(255,255,255,0.92);
             --muted: rgba(255,255,255,0.62);
             --stroke: rgba(255,255,255,0.10);
             --card: rgba(255,255,255,0.06);
+            --card2: rgba(255,255,255,0.035);
         }
 
         [data-testid="stAppViewContainer"]{
-            background:
-                radial-gradient(900px 520px at 10% 0%, rgba(122,162,247,0.14), transparent 60%),
-                radial-gradient(800px 450px at 95% 10%, rgba(72,222,128,0.10), transparent 58%),
-                linear-gradient(180deg, var(--bg2) 0%, var(--bg) 100%);
+            background: linear-gradient(180deg, var(--bg2) 0%, var(--bg) 100%);
         }
 
         /* Espaço pro topbar e pro chat input */
@@ -331,7 +375,7 @@ def inject_css():
             display:flex;
             align-items:center;
             justify-content:center;
-            background: rgba(11,15,22,0.92);
+            background: rgba(5,6,7,0.92);
             border-bottom: 1px solid rgba(255,255,255,0.08);
             backdrop-filter: blur(10px);
             z-index: 999;
@@ -384,7 +428,7 @@ def inject_css():
             height: 100vh !important;
             width: 320px !important;
             max-width: 85vw !important;
-            background: rgba(11,15,22,0.98) !important;
+            background: rgba(5,6,7,0.98) !important;
             border-right: 1px solid rgba(255,255,255,0.10) !important;
             transform: translateX(-110%) !important;
             transition: transform 180ms ease !important;
@@ -416,7 +460,7 @@ def inject_css():
             position: fixed;
             left: 0; right: 0; bottom: 0;
             padding: 10px 14px 16px 14px;
-            background: rgba(11,15,22,0.92);
+            background: rgba(5,6,7,0.92);
             border-top: 1px solid rgba(255,255,255,0.10);
             backdrop-filter: blur(10px);
             z-index: 998;
@@ -461,6 +505,51 @@ def inject_css():
         /* Scrollbar discreta */
         ::-webkit-scrollbar { width: 4px; }
         ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.18); border-radius: 4px; }
+        
+        /* ===== Minimal chat bubbles ===== */
+        div[data-testid="stChatMessage"]{
+            padding: 0.15rem 0 !important;
+        }
+        div[data-testid="stChatMessageContent"]{
+            background: var(--card2) !important;
+            border: 1px solid rgba(255,255,255,0.08) !important;
+            border-radius: 16px !important;
+            padding: 12px 14px !important;
+        }
+        div[data-testid="stChatMessageContent"] p,
+        div[data-testid="stChatMessageContent"] li{
+            color: var(--text) !important;
+        }
+        .stCaption{ color: var(--muted) !important; }
+
+        /* ===== Avatar na topbar ===== */
+        .tb-left{ display:flex; align-items:center; gap: 10px; }
+        .avatar{
+            width: 34px; height: 34px; border-radius: 999px; overflow:hidden;
+            border: 1px solid rgba(255,255,255,0.14);
+            background: rgba(255,255,255,0.06);
+            flex: 0 0 auto;
+        }
+        .avatar img{ width:100%; height:100%; object-fit: cover; display:block; }
+        .avatar-fallback{
+            width: 34px; height: 34px; border-radius: 999px;
+            border: 1px solid rgba(255,255,255,0.14);
+            background: rgba(255,255,255,0.06);
+            display:flex; align-items:center; justify-content:center;
+            color: rgba(255,255,255,0.86); font-weight: 800;
+        }
+
+        /* ===== Botões mais minimal ===== */
+        .stButton > button{
+            border-radius: 14px !important;
+            border: 1px solid rgba(255,255,255,0.10) !important;
+            background: rgba(255,255,255,0.06) !important;
+        }
+        .stButton > button:hover{
+            border-color: rgba(255,255,255,0.18) !important;
+            background: rgba(255,255,255,0.08) !important;
+        }
+
         </style>
         """,
         unsafe_allow_html=True
@@ -1142,40 +1231,66 @@ if tarefa_alertada:
         add_event("alert", f"Disparado: {tarefa_alertada['descricao']}")
 
 
+
 # =========================
-# TOPBAR (hamburger funcional + sem avatar)
+# TOPBAR (hamburger + avatar)
 # =========================
-st.markdown(
-    f"""
-    <div class="topbar">
-      <div class="topbar-inner">
-        <div id="hamb-btn" class="hamb">☰</div>
-        <div class="tb-title">{ASSISTANT_NAME} <span class="tb-sub">• {ASSISTANT_TAGLINE}</span></div>
-        <div class="tb-right"></div>
-      </div>
-    </div>
-    """,
-    unsafe_allow_html=True
+_avatar_uri = load_avatar_data_uri(st.session_state.settings)
+_avatar_html = (
+    f'<div class="avatar"><img src="{_avatar_uri}" alt="avatar"></div>'
+    if _avatar_uri else f'<div class="avatar-fallback">{ASSISTANT_NAME[:1].upper()}</div>'
 )
 
+_topbar_html = f'''
+<div class="topbar">
+  <div class="topbar-inner">
+    <div class="tb-left">
+      <div id="hamb-btn" class="hamb">☰</div>
+      {_avatar_html}
+    </div>
+    <div class="tb-title">{ASSISTANT_NAME} <span class="tb-sub">• {ASSISTANT_TAGLINE}</span></div>
+    <div class="tb-right"></div>
+  </div>
+</div>
+'''
+st.markdown(_topbar_html, unsafe_allow_html=True)
+
+
 
 # =========================
-# SIDEBAR (CONFIGURAÇÕES ESCONDIDAS AQUI)
+# SIDEBAR (TUDO DISCRETO AQUI NO HAMBÚRGUER)
 # =========================
 with st.sidebar:
-    st.markdown(f"## ⚙️ Configurações da {ASSISTANT_NAME}")
+    st.markdown(f"## {ASSISTANT_NAME}")
     st.caption(ASSISTANT_ONE_LINER)
     st.caption(f"🕒 {agora.strftime('%H:%M')} • {agora.strftime('%d/%m/%Y')}")
     st.divider()
 
+    # ===== Avatar (Rebeca / qualquer imagem que você quiser) =====
+    with st.expander("👤 Avatar", expanded=False):
+        st.caption("Envie uma imagem (png/jpg/webp). Ela vai aparecer no topo como ícone da IA.")
+        up = st.file_uploader("Avatar", type=["png", "jpg", "jpeg", "webp"], label_visibility="collapsed")
+        if up is not None:
+            st.image(up, caption="Prévia", use_container_width=True)
+            if st.button("💾 Salvar avatar", use_container_width=True):
+                st.session_state.settings = save_uploaded_avatar(up, st.session_state.settings)
+                save_settings(st.session_state.settings)
+                st.toast("Avatar salvo ✅")
+                st.rerun()
+
+        cur = (st.session_state.settings or {}).get("avatar_path") or "avatar.png"
+        if os.path.exists(cur):
+            st.caption(f"Atual: `{cur}`")
+
+    # ===== Ações rápidas =====
     colA, colB = st.columns(2)
     with colA:
-        if st.button("🔔 Teste", use_container_width=True):
+        if st.button("🔔 Teste", use_container_width=True, help="Teste Telegram + notificação do navegador"):
             request_notification_permission()
             enviar_telegram(f"Teste de notificação da {ASSISTANT_NAME}! 🤖")
             st.toast("Teste enviado (Telegram + Browser).")
     with colB:
-        if st.button("🧹 Áudio", use_container_width=True):
+        if st.button("🧹 Áudio", use_container_width=True, help="Limpa o cache do último TTS"):
             st.session_state.last_audio_bytes = None
             st.toast("Cache de áudio limpo.")
 
@@ -1183,71 +1298,70 @@ with st.sidebar:
         st.caption("Último áudio (TTS)")
         st.audio(st.session_state.last_audio_bytes, format="audio/mp3")
 
-
-# =========================
-# ROTINAS: Briefing / Lembretes / Fechamento
-# =========================
-st.markdown("### 🗓️ Rotinas")
-with st.expander("Configurar briefing, lembretes e fechamento", expanded=False):
-    s = dict(st.session_state.settings)
-
-    s["city_name"] = st.text_input("Cidade (para clima)", value=s.get("city_name","Ilhéus, BA"))
-    c1, c2 = st.columns(2)
-    with c1:
-        s["briefing_enabled"] = st.toggle("Briefing matinal", value=bool(s.get("briefing_enabled", True)))
-        s["briefing_time"] = st.text_input("Horário do briefing (HH:MM)", value=s.get("briefing_time","07:00"))
-    with c2:
-        s["closing_enabled"] = st.toggle("Fechamento diário", value=bool(s.get("closing_enabled", True)))
-        s["closing_time"] = st.text_input("Horário do fechamento (HH:MM)", value=s.get("closing_time","21:30"))
-
     st.divider()
-    s["smart_enabled"] = st.toggle("Lembretes inteligentes (clima)", value=bool(s.get("smart_enabled", True)))
-    c3, c4, c5 = st.columns(3)
-    with c3:
-        s["leave_time"] = st.text_input("Horário típico de sair (HH:MM)", value=s.get("leave_time","07:20"))
-    with c4:
-        s["rain_threshold"] = st.number_input("Chuva (%) pra lembrar", min_value=10, max_value=100, value=int(s.get("rain_threshold",60)), step=5)
-    with c5:
-        s["heat_threshold"] = st.number_input("Calor (°C) pra lembrar água", min_value=20, max_value=45, value=int(s.get("heat_threshold",30)), step=1)
 
-    st.divider()
-    geo_col1, geo_col2 = st.columns([1,1])
-    with geo_col1:
-        if st.button("📍 Atualizar localização da cidade", use_container_width=True):
-            g = geocode_city(s["city_name"])
-            if g and g.get("lat") is not None and g.get("lon") is not None:
-                s["lat"] = float(g["lat"])
-                s["lon"] = float(g["lon"])
-                st.toast(f"Localização ok: {g.get('name','')} ({s['lat']:.3f}, {s['lon']:.3f})")
-            else:
-                st.toast("Não consegui achar essa cidade 😅 Tenta: 'Ilhéus, BA' ou 'Salvador, BA'")
-    with geo_col2:
-        if st.button("💾 Salvar rotinas", use_container_width=True):
-            st.session_state.settings = dict(s)
-            save_settings(st.session_state.settings)
-            st.toast("Configurações salvas ✅")
+    # ===== Rotinas / Briefing / Fechamento (ANTES ficava no meio da tela) =====
+    with st.expander("⏱️ Rotinas", expanded=False):
+        s = dict(st.session_state.settings)
 
-    if s.get("lat") is not None and s.get("lon") is not None:
-        st.caption(f"Lat/Lon: {float(s['lat']):.3f}, {float(s['lon']):.3f}")
-    else:
-        st.caption("Lat/Lon: (não configurado) — clique em “Atualizar localização”.")
+        s["city_name"] = st.text_input("Cidade (para clima)", value=s.get("city_name","Ilhéus, BA"))
+        c1, c2 = st.columns(2)
+        with c1:
+            s["briefing_enabled"] = st.toggle("Briefing matinal", value=bool(s.get("briefing_enabled", True)))
+            s["briefing_time"] = st.text_input("Horário do briefing (HH:MM)", value=s.get("briefing_time","07:00"))
+        with c2:
+            s["closing_enabled"] = st.toggle("Fechamento diário", value=bool(s.get("closing_enabled", True)))
+            s["closing_time"] = st.text_input("Horário do fechamento (HH:MM)", value=s.get("closing_time","21:30"))
 
-    st.divider()
-    st.markdown("### 📌 Agenda")
-    if not tarefas:
-        st.caption("Vazia.")
-    else:
-        for t in sorted(tarefas, key=lambda x: x.get("data_hora", ""))[:10]:
-            st.write(f"• **{t.get('data_hora','')}** — {t.get('descricao','')[:60]}")
+        st.divider()
+        s["smart_enabled"] = st.toggle("Lembretes inteligentes (clima)", value=bool(s.get("smart_enabled", True)))
+        c3, c4, c5 = st.columns(3)
+        with c3:
+            s["leave_time"] = st.text_input("Horário típico de sair (HH:MM)", value=s.get("leave_time","07:20"))
+        with c4:
+            s["rain_threshold"] = st.number_input("Chuva (%) pra lembrar", min_value=10, max_value=100, value=int(s.get("rain_threshold",60)), step=5)
+        with c5:
+            s["heat_threshold"] = st.number_input("Calor (°C) pra lembrar água", min_value=20, max_value=45, value=int(s.get("heat_threshold",30)), step=1)
 
-    with st.expander("Gerenciar tarefas", expanded=False):
+        st.divider()
+        geo_col1, geo_col2 = st.columns([1,1])
+        with geo_col1:
+            if st.button("📍 Atualizar localização", use_container_width=True):
+                g = geocode_city(s["city_name"])
+                if g and g.get("lat") is not None and g.get("lon") is not None:
+                    s["lat"] = float(g["lat"])
+                    s["lon"] = float(g["lon"])
+                    st.toast(f"Localização ok: {g.get('name','')} ({s['lat']:.3f}, {s['lon']:.3f})")
+                else:
+                    st.toast("Não consegui achar essa cidade 😅 Tenta: 'Ilhéus, BA' ou 'Salvador, BA'")
+        with geo_col2:
+            if st.button("💾 Salvar rotinas", use_container_width=True):
+                st.session_state.settings = dict(s)
+                save_settings(st.session_state.settings)
+                st.toast("Configurações salvas ✅")
+                st.rerun()
+
+        if s.get("lat") is not None and s.get("lon") is not None:
+            st.caption(f"Lat/Lon: {float(s['lat']):.3f}, {float(s['lon']):.3f}")
+        else:
+            st.caption("Lat/Lon: (não configurado) — clique em “Atualizar localização”.")
+
+    # ===== Agenda / Tarefas =====
+    with st.expander("📌 Agenda de hoje", expanded=False):
+        if not tarefas:
+            st.caption("Vazia.")
+        else:
+            for t in sorted(tarefas, key=lambda x: x.get("data_hora", ""))[:12]:
+                st.write(f"• **{t.get('data_hora','')}** — {t.get('descricao','')[:80]}")
+
+    with st.expander("✅ Gerenciar tarefas", expanded=False):
         tarefas = [normalizar_tarefa(t) for t in carregar_tarefas()]
         salvar_tarefas(tarefas)
 
         if not tarefas:
             st.info("Sem tarefas.")
         else:
-            for t in sorted(tarefas, key=lambda x: x.get("data_hora", ""))[:20]:
+            for t in sorted(tarefas, key=lambda x: x.get("data_hora", ""))[:25]:
                 st.write(f"**{t.get('data_hora','')}** — {t.get('descricao','')}")
                 c1, c2, c3 = st.columns(3)
                 if c1.button("✅", key=f"done_{t['id']}", help="Feito"):
@@ -1271,32 +1385,31 @@ with st.expander("Configurar briefing, lembretes e fechamento", expanded=False):
                     st.rerun()
                 st.divider()
 
-    st.divider()
-    st.markdown("### 🧠 Memória")
-    with st.expander("Resumo vivo", expanded=False):
-        resumo = st.text_area("Resumo", value=load_summary(), height=160)
-        if st.button("💾 Salvar resumo"):
-            save_summary(resumo)
-            st.toast("Resumo salvo.")
+    # ===== Memória =====
+    with st.expander("🧠 Memória", expanded=False):
+        with st.expander("Resumo vivo", expanded=False):
+            resumo = st.text_area("Resumo", value=load_summary(), height=160)
+            if st.button("💾 Salvar resumo", use_container_width=True):
+                save_summary(resumo)
+                st.toast("Resumo salvo.")
 
-    with st.expander("Buscar na memória", expanded=False):
-        q = st.text_input("Buscar", placeholder="Ex: alerta, tarefa, mercado…")
-        if q.strip():
-            rows = search_memories(q.strip(), limit=10)
-            if not rows:
-                st.caption("Nada encontrado.")
-            else:
-                for ts, kind, content in rows:
-                    st.caption(f"{ts} • {kind}")
-                    st.write(content)
-                    st.divider()
+        with st.expander("Buscar na memória", expanded=False):
+            q = st.text_input("Buscar", placeholder="Ex: alerta, tarefa, mercado…")
+            if q.strip():
+                rows = search_memories(q.strip(), limit=10)
+                if not rows:
+                    st.caption("Nada encontrado.")
+                else:
+                    for ts, kind, content in rows:
+                        st.caption(f"{ts} • {kind}")
+                        st.write(content)
+                        st.divider()
 
     st.divider()
     if st.button("🗑️ Limpar chat", use_container_width=True):
         st.session_state.memoria = []
         st.toast("Chat limpo.")
         st.rerun()
-
 
 # =========================
 # CHAT (ÚNICA COISA NA TELA PRINCIPAL)
