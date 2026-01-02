@@ -1079,6 +1079,86 @@ def limpar_texto(s: str) -> str:
     s = re.sub(r"[^a-z0-9áàâãéèêíìîóòôõúùûç\s]", " ", s)
     return re.sub(r"\s+", " ", s).strip()
 
+
+# =========================
+# INTENÇÕES (GUARDA-CORPOS)
+# =========================
+
+_WEEKDAY_PT = [
+    "segunda-feira", "terça-feira", "quarta-feira",
+    "quinta-feira", "sexta-feira", "sábado", "domingo"
+]
+
+def is_date_question(tnorm: str) -> bool:
+    return bool(re.search(r"\b(que dia e hoje|que dia é hoje|qual a data|data de hoje|hoje e que dia|hoje é que dia)\b", tnorm))
+
+def is_time_question(tnorm: str) -> bool:
+    return bool(re.search(r"\b(que horas|horas s[aã]o|que hora)\b", tnorm))
+
+def is_memory_question(tnorm: str) -> bool:
+    # usuário pedindo pra lembrar o que foi dito/perguntado antes
+    pats = [
+        r"o que eu (te )?perguntei", r"o que eu falei", r"o que eu disse",
+        r"qual foi minha (ultima|última) pergunta", r"qual foi a (ultima|última) coisa que eu",
+        r"lembra( do)? que eu", r"você lembra( do)? que eu"
+    ]
+    return any(re.search(p, tnorm) for p in pats)
+
+def summarize_previous_user_messages(memoria: list, k: int = 4) -> str:
+    # pega as últimas mensagens do usuário (exclui a atual, que já está no fim)
+    user_msgs = [m.get("content","").strip() for m in (memoria or []) if m.get("role") == "user" and str(m.get("content","")).strip()]
+    if len(user_msgs) <= 1:
+        return "Ainda não tenho histórico suficiente aqui nesse chat 😅"
+    prev = user_msgs[:-1][-k:]
+    bullets = "\n".join([f"- {x}" for x in prev])
+    return f"Você tinha me perguntado isso aqui mais cedo:\n{bullets}"
+
+def is_task_create_intent(tnorm: str) -> bool:
+    # Só cria tarefa quando o usuário realmente pede um lembrete/tarefa
+    triggers = [
+        "me lembra", "me lembre", "lembra de", "lembrete", "agenda", "agende", "agendar",
+        "marca pra", "marcar pra", "marcar para", "anota", "anote", "cria uma tarefa", "criar uma tarefa",
+        "me avisa", "me notifica", "programa um lembrete", "seta um lembrete", "coloca na agenda"
+    ]
+    if any(t in tnorm for t in triggers):
+        return True
+
+    # formato “amanhã 15:00 pagar conta” (sem 'me lembra'), bem típico
+    if re.search(r"\b(hoje|amanh[aã]|depois de amanh[aã]|segunda|ter[cç]a|quarta|quinta|sexta|s[aá]bado|domingo)\b", tnorm) and re.search(r"\b\d{1,2}:\d{2}\b", tnorm):
+        return True
+    if re.search(r"\b\d{1,2}/\d{1,2}(/\d{2,4})?\b", tnorm) and (re.search(r"\b\d{1,2}:\d{2}\b", tnorm) or "às" in tnorm or "as " in tnorm):
+        return True
+
+    return False
+
+def is_task_done_intent(tnorm: str) -> bool:
+    triggers = [
+        "marcar como feito", "marca como feito", "conclui", "concluí", "concluido", "concluído",
+        "feito", "já fiz", "ja fiz", "finalizei", "remover tarefa", "remove tarefa", "apagar tarefa",
+        "deletar tarefa", "cancelar tarefa"
+    ]
+    return any(t in tnorm for t in triggers)
+
+def response_looks_like_non_answer(resp_txt: str) -> bool:
+    r = limpar_texto(resp_txt or "")
+    bad = [
+        "nao sei", "não sei", "nao tenho certeza", "não tenho certeza", "nao consigo",
+        "não consigo", "nao tenho acesso", "não tenho acesso", "nao lembro", "não lembro",
+        "preciso de mais contexto", "nao encontrei", "não encontrei", "use /web", "usa /web"
+    ]
+    return any(b in r for b in bad)
+
+def should_auto_web(user_txt: str, resp_txt: str) -> bool:
+    # Só dispara web quando a resposta claramente é “não sei/usa web”.
+    t = limpar_texto(user_txt or "")
+    # não faz web pra perguntas de memória/local
+    if is_memory_question(t) or is_time_question(t) or is_date_question(t):
+        return False
+    # evita web quando o usuário explicitamente não quer web
+    if "sem web" in t or "não use web" in t or "nao use web" in t:
+        return False
+    return response_looks_like_non_answer(resp_txt)
+
 def normalizar_tarefa(d: dict) -> dict:
     agora = now_floor_minute()
     d = dict(d)
@@ -1212,6 +1292,20 @@ Conversa recente (pra manter contexto):
 {recent_chat}
 
 Mensagem do usuário: "{texto}"
+
+Você vai escolher **UMA** ação.
+
+Regras MUITO importantes (pra não viajar):
+1) **TASK_CREATE** só quando o usuário pedir explicitamente um lembrete/tarefa.
+   Exemplos: "me lembra...", "lembrete", "agenda/agende", "anota", "marca pra...", "me avisa", "me notifica".
+   Perguntas tipo "o que é X?", "que dia é hoje?", "qual a hora?", "explica X" **NÃO** são tarefas.
+2) **TASK_DONE** só quando o usuário pedir pra concluir/remover uma tarefa.
+   Exemplos: "marcar como feito", "já fiz", "concluí", "remove/apaga a tarefa".
+3) **WEB_SEARCH** quando a pergunta depende de dados atuais (notícia, preço, resultado, "hoje/atual") OU quando você não tem confiança alta pra responder sem pesquisar.
+4) Caso contrário, use **CHAT**.
+
+Se escolher TASK_DONE, use "task_index" da tarefa mais relacionada. Se não tiver, use -1.
+Se escolher WEB_SEARCH, "search_query" deve ser uma consulta curta e objetiva (ou "" se não aplicar).
 
 Responda APENAS o JSON:
 {{
@@ -1882,17 +1976,42 @@ if user_txt:
 
     # 3. Lógica Normal (ELSE) - só roda se não caiu nos anteriores
     else:
-        # Atalho determinístico: horas/data (evita alucinação e fica estável)
+        # Atalho determinístico: hora / data / memória de curto prazo
         tnorm = limpar_texto(user_txt)
-        if re.search(r"\b(que horas|horas s[aã]o|que hora)\b", tnorm):
+
+        if is_time_question(tnorm):
             agora_br = now_br()
             resp_txt = f"Agora no Brasil são **{agora_br.strftime('%H:%M')}** ({agora_br.strftime('%d/%m/%Y')})."
             chat_add("assistant", resp_txt)
             add_event("chat_assistant", resp_txt)
             st.rerun()
 
+        if is_date_question(tnorm):
+            agora_br = now_br()
+            wd = _WEEKDAY_PT[agora_br.weekday()]
+            resp_txt = f"Hoje é **{wd}**, **{agora_br.strftime('%d/%m/%Y')}**."
+            chat_add("assistant", resp_txt)
+            add_event("chat_assistant", resp_txt)
+            st.rerun()
+
+        if is_memory_question(tnorm):
+            resp_txt = summarize_previous_user_messages(st.session_state.memoria, k=5)
+            chat_add("assistant", resp_txt)
+            add_event("chat_assistant", resp_txt)
+            st.rerun()
+
+
         with st.spinner(f"{ASSISTANT_NAME} tá pensando..."):
             acao = decidir_acao(user_txt, tarefas, settings)
+
+            # Guarda-corpos: evita a Zoe criar/concluir tarefa sem o usuário pedir
+            if acao.get("action") == "TASK_CREATE" and not is_task_create_intent(tnorm):
+                # era pergunta, não tarefa
+                acao = {"action": "CHAT", "task_index": -1, "minutes": 0, "search_query": ""}
+
+            if acao.get("action") == "TASK_DONE" and not is_task_done_intent(tnorm):
+                # não pediu pra concluir nada
+                acao = {"action": "CHAT", "task_index": -1, "minutes": 0, "search_query": ""}
 
             if acao.get("action") == "TASK_CREATE":
                 d = extrair_dados_tarefa(user_txt)
@@ -2003,6 +2122,37 @@ Regras rápidas:
                     ).choices[0].message.content
                 except Exception:
                     resp_txt = "Ops, deu um errinho pra gerar a resposta agora 😅 Tenta de novo?"
+
+                # Auto-web: se a resposta ficou "não sei / usa /web", a Zoe pesquisa sozinha e volta com algo útil
+                if should_auto_web(user_txt, resp_txt):
+                    q = user_txt
+                    res = buscar_tavily(q)
+                    if res:
+                        web_used = True
+                        prompt_web = f"""
+{ZOE_PERSONA}
+
+Você recebeu resultados de busca na web (resuma e responda com base neles).
+RESULTADOS:
+{res}
+
+PERGUNTA DO USUÁRIO:
+{user_txt}
+
+Responda direto, do jeito da Zoe (curto, útil, com gíria leve/emoji na medida).
+""".strip()
+                        try:
+                            resp_txt = client.chat.completions.create(
+                                model=MODEL_ID,
+                                messages=[{"role": "user", "content": prompt_web}],
+                                temperature=0.2
+                            ).choices[0].message.content
+                        except Exception:
+                            resp_txt = "Consegui buscar, mas deu ruim pra montar a resposta 😅 Tenta de novo?"
+                        add_event("web_search", f"Q: {q}")
+                    else:
+                        # sem resultado — mantém a resposta original
+                        pass
 
         meta_flags = {}
         if web_used:
