@@ -1001,12 +1001,47 @@ Se hora não for dita, assuma o próximo horário lógico.
         return None
 
 
+
+
+# =========================
+# CHAT CONTEXTO (LIMPEZA)
+# =========================
+def to_llm_messages(memoria: list, limit: int = 20) -> list:
+    """Converte o histórico do Streamlit (que pode ter chaves extras) para o formato aceito pelo LLM."""
+    out = []
+    if not memoria:
+        return out
+    for m in memoria[-limit:]:
+        try:
+            role = m.get("role")
+            content = m.get("content")
+        except Exception:
+            continue
+        if role not in ("user", "assistant", "system"):
+            continue
+        if content is None:
+            continue
+        out.append({"role": role, "content": str(content)})
+    return out
+
+def format_recent_dialogue(memoria: list, limit: int = 8) -> str:
+    """Cria um resumo curtinho do diálogo recente (pra roteamento/decisão)."""
+    parts = []
+    for m in to_llm_messages(memoria, limit=limit):
+        who = "Usuário" if m["role"] == "user" else ASSISTANT_NAME
+        txt = m["content"].strip().replace("\n", " ")
+        if len(txt) > 160:
+            txt = txt[:160] + "…"
+        parts.append(f"- {who}: {txt}")
+    return "\n".join(parts).strip()
+
 # =========================
 # ROUTER
 # =========================
 def router_llm(texto: str, tarefas: list) -> dict:
     agora = format_dt(now_floor_minute())
     resumo_tarefas = "\n".join([f"{i}: {t['descricao']}" for i, t in enumerate(tarefas)])
+    recent_chat = format_recent_dialogue(st.session_state.memoria[:-1] if "memoria" in st.session_state else [], limit=10)
 
     prompt = f"""
 {ZOE_PERSONA}
@@ -1014,6 +1049,9 @@ def router_llm(texto: str, tarefas: list) -> dict:
 Agora é {agora}.
 Tarefas pendentes:
 {resumo_tarefas}
+
+Conversa recente (pra manter contexto):
+{recent_chat}
 
 Mensagem do usuário: "{texto}"
 
@@ -1503,6 +1541,15 @@ if user_txt:
 
     # 3. Lógica Normal (ELSE) - só roda se não caiu nos anteriores
     else:
+        # Atalho determinístico: horas/data (evita alucinação e fica estável)
+        tnorm = limpar_texto(user_txt)
+        if re.search(r"\b(que horas|horas s[aã]o|que hora)\b", tnorm):
+            agora_br = now_br()
+            resp_txt = f"Agora no Brasil são **{agora_br.strftime('%H:%M')}** ({agora_br.strftime('%d/%m/%Y')})."
+            st.session_state.memoria.append({"role": "assistant", "content": resp_txt})
+            add_event("chat_assistant", resp_txt)
+            st.rerun()
+
         with st.spinner(f"{ASSISTANT_NAME} tá pensando..."):
             acao = decidir_acao(user_txt, tarefas)
 
@@ -1572,7 +1619,7 @@ Regras rápidas:
 - Se a pergunta pedir algo que depende de dados atuais, sugira usar /web.
 """.strip()
 
-                msgs = [{"role": "system", "content": sys_prompt}] + st.session_state.memoria[-8:]
+                msgs = [{"role": "system", "content": sys_prompt}] + to_llm_messages(st.session_state.memoria, limit=20)
                 try:
                     resp_txt = client.chat.completions.create(
                         model=MODEL_ID,
