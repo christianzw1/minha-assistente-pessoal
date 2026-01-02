@@ -51,7 +51,8 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-MODEL_ID = "llama-3.3-70b-versatile"
+# MUDANÇA: Modelo mais rápido para evitar lentidão
+MODEL_ID = "llama-3.1-8b-instant"
 ARQUIVO_TAREFAS = "tarefas.json"
 
 FUSO_BR = ZoneInfo("America/Sao_Paulo")
@@ -63,6 +64,7 @@ QUIET_START = 22
 QUIET_END = 7
 
 AUTO_REFRESH_MS = 10_000  # 10s
+
 # =========================
 # ROTINAS (BRIEFING / LEMBRETES / FECHAMENTO)
 # =========================
@@ -1362,54 +1364,52 @@ resp_txt = ""
 # =========================
 # FECHAMENTO DIÁRIO (captura resposta do usuário)
 # =========================
-# =========================
-# FECHAMENTO DIÁRIO (captura resposta do usuário)
-# =========================
-# 1. Comando manual para iniciar fechamento
-if user_txt and user_txt.strip().lower().startswith("/fechamento"):
-    st.session_state.awaiting_closing = True
-    st.session_state.daily_state["awaiting_closing"] = True
-    save_daily_state(st.session_state.daily_state)
-    resp_txt = build_closing_prompt(now_floor_minute())
-    st.session_state.memoria.append({"role": "assistant", "content": resp_txt})
-    add_event("closing_prompt_manual", resp_txt)
-    st.rerun()
+# A LÓGICA AGORA SÓ EXECUTA SE TIVER TEXTO DO USUÁRIO
+if user_txt:
+    # 1. Comando manual
+    if user_txt.strip().lower().startswith("/fechamento"):
+        st.session_state.awaiting_closing = True
+        st.session_state.daily_state["awaiting_closing"] = True
+        save_daily_state(st.session_state.daily_state)
+        resp_txt = build_closing_prompt(now_floor_minute())
+        st.session_state.memoria.append({"role": "assistant", "content": resp_txt})
+        add_event("closing_prompt_manual", resp_txt)
+        st.rerun()
 
-# 2. Se estiver aguardando fechamento, processa e reinicia
-if st.session_state.awaiting_closing and user_txt and not user_txt.strip().startswith("/"):
-    # Trata essa mensagem como resposta do fechamento (sem passar pelo router)
-    add_event("daily_review", user_txt)
-    update_summary_with_llm(f"Fechamento do dia: {user_txt}")
-    st.session_state.awaiting_closing = False
-    st.session_state.daily_state["awaiting_closing"] = False
-    save_daily_state(st.session_state.daily_state)
-    resp_txt = "Fechou 😄 Registrei teu fechamento de hoje. Amanhã eu já ajusto o teu briefing/lembretes com base nisso."
-    st.session_state.memoria.append({"role": "assistant", "content": resp_txt})
-    add_event("chat_assistant", resp_txt)
-    st.rerun()
+    # 2. Resposta de fechamento (se pendente)
+    elif st.session_state.awaiting_closing and not user_txt.strip().startswith("/"):
+        add_event("daily_review", user_txt)
+        update_summary_with_llm(f"Fechamento do dia: {user_txt}")
+        st.session_state.awaiting_closing = False
+        st.session_state.daily_state["awaiting_closing"] = False
+        save_daily_state(st.session_state.daily_state)
+        resp_txt = "Fechou 😄 Registrei teu fechamento de hoje. Amanhã eu já ajusto o teu briefing/lembretes com base nisso."
+        st.session_state.memoria.append({"role": "assistant", "content": resp_txt})
+        add_event("chat_assistant", resp_txt)
+        st.rerun()
 
-# 3. LÓGICA NORMAL (AQUI ESTAVA O ERRO DE INDENTAÇÃO)
-# Este bloco agora roda sempre que NÃO for um comando de fechamento
-with st.spinner(f"{ASSISTANT_NAME} tá pensando..."):
-    acao = decidir_acao(user_txt, tarefas)
+    # 3. Lógica Normal (ELSE) - só roda se não caiu nos anteriores
+    else:
+        with st.spinner(f"{ASSISTANT_NAME} tá pensando..."):
+            acao = decidir_acao(user_txt, tarefas)
 
-    if acao.get("action") == "TASK_CREATE":
-        d = extrair_dados_tarefa(user_txt)
-        if d:
-            d = normalizar_tarefa(d)
-            tarefas.append(d)
-            salvar_tarefas(tarefas)
-            resp_txt = f"Fechou! ✅ Agendei **{d['descricao']}** pra **{d['data_hora']}**."
-            add_event("task_create", resp_txt)
-            update_summary_with_llm(f"Nova tarefa: {d['descricao']} @ {d['data_hora']}")
-        else:
-            resp_txt = "Beleza… mas não peguei a data/hora 😅 Ex: *me lembra de X amanhã às 15:00*."
+            if acao.get("action") == "TASK_CREATE":
+                d = extrair_dados_tarefa(user_txt)
+                if d:
+                    d = normalizar_tarefa(d)
+                    tarefas.append(d)
+                    salvar_tarefas(tarefas)
+                    resp_txt = f"Fechou! ✅ Agendei **{d['descricao']}** pra **{d['data_hora']}**."
+                    add_event("task_create", resp_txt)
+                    update_summary_with_llm(f"Nova tarefa: {d['descricao']} @ {d['data_hora']}")
+                else:
+                    resp_txt = "Beleza… mas não peguei a data/hora 😅 Ex: *me lembra de X amanhã às 15:00*."
 
-    elif acao.get("action") == "WEB_SEARCH":
-        web_used = True
-        q = acao.get("search_query") or user_txt
-        res = buscar_tavily(q)
-        prompt_web = f"""
+            elif acao.get("action") == "WEB_SEARCH":
+                web_used = True
+                q = acao.get("search_query") or user_txt
+                res = buscar_tavily(q)
+                prompt_web = f"""
 {ZOE_PERSONA}
 
 Você recebeu resultados de busca na web (resuma e responda com base neles).
@@ -1421,30 +1421,30 @@ PERGUNTA DO USUÁRIO:
 
 Responda direto, do jeito da Zoe (curto, útil, com gíria leve/emoji na medida).
 """.strip()
-        try:
-            resp_txt = client.chat.completions.create(
-                model=MODEL_ID,
-                messages=[{"role": "user", "content": prompt_web}]
-            ).choices[0].message.content
-        except Exception:
-            resp_txt = "Deu ruim pra consultar a web agora 😅 Tenta de novo daqui a pouquinho."
-        add_event("web_search", f"Q: {q}")
+                try:
+                    resp_txt = client.chat.completions.create(
+                        model=MODEL_ID,
+                        messages=[{"role": "user", "content": prompt_web}]
+                    ).choices[0].message.content
+                except Exception:
+                    resp_txt = "Deu ruim pra consultar a web agora 😅 Tenta de novo daqui a pouquinho."
+                add_event("web_search", f"Q: {q}")
 
-    elif acao.get("action") == "TASK_DONE":
-        if tarefas:
-            removida = tarefas.pop(0)
-            salvar_tarefas(tarefas)
-            resp_txt = f"Top! ✅ Marquei como feito: **{removida['descricao']}**."
-            add_event("task_done", resp_txt)
-            update_summary_with_llm(f"Concluiu: {removida['descricao']}")
-        else:
-            resp_txt = "Não tem nada na agenda agora — tá suave 😄"
+            elif acao.get("action") == "TASK_DONE":
+                if tarefas:
+                    removida = tarefas.pop(0)
+                    salvar_tarefas(tarefas)
+                    resp_txt = f"Top! ✅ Marquei como feito: **{removida['descricao']}**."
+                    add_event("task_done", resp_txt)
+                    update_summary_with_llm(f"Concluiu: {removida['descricao']}")
+                else:
+                    resp_txt = "Não tem nada na agenda agora — tá suave 😄"
 
-    else:
-        # CHAT NORMAL
-        mems = search_memories(user_txt)
-        ctx_mem = "\n".join([m[2] for m in mems])
-        sys_prompt = f"""{ZOE_PERSONA}
+            else:
+                # CHAT NORMAL
+                mems = search_memories(user_txt)
+                ctx_mem = "\n".join([m[2] for m in mems])
+                sys_prompt = f"""{ZOE_PERSONA}
 
 Informações do usuário (resumo vivo):
 {load_summary()}
@@ -1459,23 +1459,23 @@ Regras rápidas:
 - Se a pergunta pedir algo que depende de dados atuais, sugira usar /web.
 """.strip()
 
-        msgs = [{"role": "system", "content": sys_prompt}] + st.session_state.memoria[-8:]
-        try:
-            resp_txt = client.chat.completions.create(
-                model=MODEL_ID,
-                messages=msgs,
-                temperature=0.2
-            ).choices[0].message.content
-        except Exception:
-            resp_txt = "Ops, deu um errinho pra gerar a resposta agora 😅 Tenta de novo?"
+                msgs = [{"role": "system", "content": sys_prompt}] + st.session_state.memoria[-8:]
+                try:
+                    resp_txt = client.chat.completions.create(
+                        model=MODEL_ID,
+                        messages=msgs,
+                        temperature=0.2
+                    ).choices[0].message.content
+                except Exception:
+                    resp_txt = "Ops, deu um errinho pra gerar a resposta agora 😅 Tenta de novo?"
 
-st.session_state.memoria.append({"role": "assistant", "content": resp_txt, **({"web_used": True} if web_used else {})})
-add_event("chat_assistant", resp_txt)
+        st.session_state.memoria.append({"role": "assistant", "content": resp_txt, **({"web_used": True} if web_used else {})})
+        add_event("chat_assistant", resp_txt)
 
-# Se veio de voz, TTS curtinho (opcional)
-if usou_voz_proc and resp_txt:
-    b = falar_bytes(resp_txt[:180])
-    if b:
-        st.session_state.last_audio_bytes = b
+        # Se veio de voz, TTS curtinho (opcional)
+        if usou_voz_proc and resp_txt:
+            b = falar_bytes(resp_txt[:180])
+            if b:
+                st.session_state.last_audio_bytes = b
 
-st.rerun()
+        st.rerun()
