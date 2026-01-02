@@ -693,11 +693,128 @@ def enviar_telegram(mensagem: str):
         pass
 
 
+
+# =========================
+# STORAGE CHAT (PERSISTÊNCIA DIÁRIA)
+# =========================
+CHAT_HISTORY_PATH = "chat_history.json"
+CHAT_MAX_MESSAGES = 400
+
+def chat_history_path() -> str:
+    """Caminho absoluto do arquivo de histórico do chat."""
+    return os.path.abspath(CHAT_HISTORY_PATH)
+
+def load_chat_history() -> tuple:
+    """Carrega histórico do chat do disco. Retorna (day_key, messages)."""
+    path = chat_history_path()
+    today = today_key(datetime.now(FUSO_BR))
+    if not os.path.exists(path):
+        return (today, [])
+    try:
+        raw = json.loads(open(path, "r", encoding="utf-8").read() or "{}")
+        if isinstance(raw, dict):
+            day = str(raw.get("day") or today)
+            msgs = raw.get("messages") or []
+        elif isinstance(raw, list):
+            # compat: versões antigas podem ter salvado só a lista
+            day = today
+            msgs = raw
+        else:
+            return (today, [])
+
+        if not isinstance(msgs, list):
+            msgs = []
+
+        cleaned = []
+        for m in msgs:
+            if not isinstance(m, dict):
+                continue
+            role = m.get("role")
+            content = m.get("content")
+            if role not in ("user", "assistant", "system"):
+                continue
+            if content is None:
+                continue
+            mm = dict(m)
+            mm["role"] = role
+            mm["content"] = str(content)
+            cleaned.append(mm)
+
+        return (day, cleaned)
+    except Exception:
+        return (today, [])
+
+def save_chat_history(day: str, messages: list) -> None:
+    """Salva histórico do chat de forma atômica (resistente a reruns)."""
+    path = chat_history_path()
+    base_dir = os.path.dirname(path) or "."
+    os.makedirs(base_dir, exist_ok=True)
+
+    payload = {"day": str(day), "messages": messages}
+    tmp_path = ""
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", delete=False, dir=base_dir,
+            prefix=os.path.basename(path) + ".", suffix=".tmp"
+        ) as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+            tmp_path = f.name
+
+        os.replace(tmp_path, path)
+        st.session_state.last_chat_storage_error = ""
+    except Exception as e:
+        try:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        st.session_state.last_chat_storage_error = f"{type(e).__name__}: {e}"
+
+def ensure_chat_day_is_today() -> None:
+    """Se virou o dia (00:00), limpa o chat automaticamente."""
+    today = today_key(datetime.now(FUSO_BR))
+    if st.session_state.get("chat_day") != today:
+        st.session_state.chat_day = today
+        st.session_state.memoria = []
+        save_chat_history(today, st.session_state.memoria)
+
+def chat_add(role: str, content: str, **extra) -> None:
+    """Append no chat + persistência no disco."""
+    ensure_chat_day_is_today()
+
+    m = {"role": role, "content": content}
+    if extra:
+        m.update(extra)
+
+    st.session_state.memoria.append(m)
+
+    # corte de segurança (evita arquivo gigante)
+    if len(st.session_state.memoria) > CHAT_MAX_MESSAGES:
+        st.session_state.memoria = st.session_state.memoria[-CHAT_MAX_MESSAGES:]
+
+    save_chat_history(st.session_state.chat_day, st.session_state.memoria)
+
+
 # =========================
 # SESSION STATE
 # =========================
-if "memoria" not in st.session_state:
-    st.session_state.memoria = []
+if "last_chat_storage_error" not in st.session_state:
+    st.session_state.last_chat_storage_error = ""
+if "memoria" not in st.session_state or "chat_day" not in st.session_state:
+    _day, _msgs = load_chat_history()
+    _today = today_key(datetime.now(FUSO_BR))
+    if _day != _today:
+        _day, _msgs = _today, []
+    st.session_state.chat_day = _day
+    st.session_state.memoria = _msgs
+    # garante que o arquivo exista/esteja alinhado
+    save_chat_history(st.session_state.chat_day, st.session_state.memoria)
 if "ultimo_audio_hash" not in st.session_state:
     st.session_state.ultimo_audio_hash = None
 if "last_alert_fingerprint" not in st.session_state:
@@ -732,6 +849,8 @@ if "smart_flags" not in st.session_state:
 if "awaiting_closing" not in st.session_state:
     st.session_state.awaiting_closing = bool(st.session_state.daily_state.get("awaiting_closing", False))
 
+
+ensure_chat_day_is_today()
 
 # =========================
 # UTILS TEMPO & FORMAT
@@ -1465,7 +1584,7 @@ if tarefa_alertada:
             f"⏰ **{tarefa_alertada['data_hora']}**"
         )
 
-        st.session_state.memoria.append({"role": "assistant", "content": mensagem_alerta})
+        chat_add("assistant", mensagem_alerta)
 
         browser_notify("Lembrete", tarefa_alertada["descricao"])
         enviar_telegram(f"🔔 *ALERTA*: {tarefa_alertada['descricao']}\n⏰ {tarefa_alertada['data_hora']}")
@@ -1517,6 +1636,8 @@ with st.sidebar:
     # Aviso: se o arquivo de tarefas não puder ser gravado, o app continua — mas te avisa aqui
     if st.session_state.get('last_storage_error'):
         st.warning('Problema ao salvar tarefas: ' + st.session_state.last_storage_error)
+    if st.session_state.get('last_chat_storage_error'):
+        st.warning('Problema ao salvar chat: ' + st.session_state.last_chat_storage_error)
 
 
     # ===== Avatar (Rebeca / qualquer imagem que você quiser) =====
@@ -1660,7 +1781,9 @@ with st.sidebar:
 
     st.divider()
     if st.button("🗑️ Limpar chat", use_container_width=True):
+        ensure_chat_day_is_today()
         st.session_state.memoria = []
+        save_chat_history(st.session_state.chat_day, st.session_state.memoria)
         st.toast("Chat limpo.")
         st.rerun()
 
@@ -1719,7 +1842,7 @@ if st.session_state.pending_input:
     st.session_state.pending_input = None
     st.session_state.pending_usou_voz = False
 
-    st.session_state.memoria.append({"role": "user", "content": user_txt})
+    chat_add("user", user_txt)
     add_event("chat_user", user_txt)
 
     tarefas = [normalizar_tarefa(t) for t in carregar_tarefas()]
@@ -1741,7 +1864,7 @@ if user_txt:
         st.session_state.daily_state["awaiting_closing"] = True
         save_daily_state(st.session_state.daily_state)
         resp_txt = build_closing_prompt(now_floor_minute())
-        st.session_state.memoria.append({"role": "assistant", "content": resp_txt})
+        chat_add("assistant", resp_txt)
         add_event("closing_prompt_manual", resp_txt)
         st.rerun()
 
@@ -1753,7 +1876,7 @@ if user_txt:
         st.session_state.daily_state["awaiting_closing"] = False
         save_daily_state(st.session_state.daily_state)
         resp_txt = "Fechou 😄 Registrei teu fechamento de hoje. Amanhã eu já ajusto o teu briefing/lembretes com base nisso."
-        st.session_state.memoria.append({"role": "assistant", "content": resp_txt})
+        chat_add("assistant", resp_txt)
         add_event("chat_assistant", resp_txt)
         st.rerun()
 
@@ -1764,7 +1887,7 @@ if user_txt:
         if re.search(r"\b(que horas|horas s[aã]o|que hora)\b", tnorm):
             agora_br = now_br()
             resp_txt = f"Agora no Brasil são **{agora_br.strftime('%H:%M')}** ({agora_br.strftime('%d/%m/%Y')})."
-            st.session_state.memoria.append({"role": "assistant", "content": resp_txt})
+            chat_add("assistant", resp_txt)
             add_event("chat_assistant", resp_txt)
             st.rerun()
 
@@ -1886,7 +2009,7 @@ Regras rápidas:
             meta_flags["web_used"] = True
         if weather_used:
             meta_flags["weather_used"] = True
-        st.session_state.memoria.append({"role": "assistant", "content": resp_txt, **meta_flags})
+        chat_add("assistant", resp_txt, **meta_flags)
         add_event("chat_assistant", resp_txt)
 
         # Se veio de voz, TTS curtinho (opcional)
