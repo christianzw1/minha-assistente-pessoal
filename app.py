@@ -833,6 +833,8 @@ if "pending_input" not in st.session_state:
     st.session_state.pending_input = None
 if "pending_usou_voz" not in st.session_state:
     st.session_state.pending_usou_voz = False
+if "pending_user_added" not in st.session_state:
+    st.session_state.pending_user_added = False
 
 
 # Rotinas: estado diário / dedupe
@@ -1588,8 +1590,6 @@ def schedule_next(agora: datetime, t: dict) -> dict:
 # =========================
 # REFRESH LOOP
 # =========================
-st_autorefresh(interval=AUTO_REFRESH_MS, key="tick")
-
 agora = now_floor_minute()
 _raw_tarefas = carregar_tarefas()
 tarefas = [normalizar_tarefa(t) for t in _raw_tarefas]
@@ -1917,28 +1917,36 @@ if audio_val:
 # =========================
 # LÓGICA DE RESPOSTA
 # =========================
+def clear_pending():
+    """Limpa o estado de input pendente (evita perder mensagem em reruns)."""
+    st.session_state.pending_input = None
+    st.session_state.pending_usou_voz = False
+    st.session_state.pending_user_added = False
+
 # Para evitar casos em que o usuário envia e um rerun/auto-refresh “engole” a mensagem,
-# a gente guarda a entrada em session_state e processa em seguida.
+# a gente guarda a entrada em session_state e processa em seguida (de forma idempotente).
 if texto_input and st.session_state.pending_input is None and should_process_input(str(texto_input)):
     st.session_state.pending_input = str(texto_input).strip()
     st.session_state.pending_usou_voz = bool(usou_voz)
+    st.session_state.pending_user_added = False
 
 
 # Defaults para evitar NameError quando não há input neste rerun
 user_txt = ""
 usou_voz_proc = False
 
+# Se tiver algo pendente, processa — mas sem “perder” a pendência até finalizar a resposta
 if st.session_state.pending_input:
     user_txt = str(st.session_state.pending_input).strip()
     usou_voz_proc = bool(st.session_state.pending_usou_voz)
 
-    # limpa pendência antes de processar (evita loop se der exceção)
-    st.session_state.pending_input = None
-    st.session_state.pending_usou_voz = False
+    # Só registra a msg do usuário 1 vez, mesmo que haja rerun no meio
+    if not st.session_state.pending_user_added:
+        chat_add("user", user_txt)
+        add_event("chat_user", user_txt)
+        st.session_state.pending_user_added = True
 
-    chat_add("user", user_txt)
-    add_event("chat_user", user_txt)
-
+    # Recarrega tarefas (garante consistência)
     tarefas = [normalizar_tarefa(t) for t in carregar_tarefas()]
     salvar_tarefas(tarefas)
 
@@ -1960,8 +1968,8 @@ if user_txt:
         resp_txt = build_closing_prompt(now_floor_minute())
         chat_add("assistant", resp_txt)
         add_event("closing_prompt_manual", resp_txt)
+        clear_pending()
         st.rerun()
-
     # 2. Resposta de fechamento (se pendente)
     elif st.session_state.awaiting_closing and not user_txt.strip().startswith("/"):
         add_event("daily_review", user_txt)
@@ -1972,8 +1980,8 @@ if user_txt:
         resp_txt = "Fechou 😄 Registrei teu fechamento de hoje. Amanhã eu já ajusto o teu briefing/lembretes com base nisso."
         chat_add("assistant", resp_txt)
         add_event("chat_assistant", resp_txt)
+        clear_pending()
         st.rerun()
-
     # 3. Lógica Normal (ELSE) - só roda se não caiu nos anteriores
     else:
         # Atalho determinístico: hora / data / memória de curto prazo
@@ -1984,23 +1992,22 @@ if user_txt:
             resp_txt = f"Agora no Brasil são **{agora_br.strftime('%H:%M')}** ({agora_br.strftime('%d/%m/%Y')})."
             chat_add("assistant", resp_txt)
             add_event("chat_assistant", resp_txt)
+            clear_pending()
             st.rerun()
-
         if is_date_question(tnorm):
             agora_br = now_br()
             wd = _WEEKDAY_PT[agora_br.weekday()]
             resp_txt = f"Hoje é **{wd}**, **{agora_br.strftime('%d/%m/%Y')}**."
             chat_add("assistant", resp_txt)
             add_event("chat_assistant", resp_txt)
+            clear_pending()
             st.rerun()
-
         if is_memory_question(tnorm):
             resp_txt = summarize_previous_user_messages(st.session_state.memoria, k=5)
             chat_add("assistant", resp_txt)
             add_event("chat_assistant", resp_txt)
+            clear_pending()
             st.rerun()
-
-
         with st.spinner(f"{ASSISTANT_NAME} tá pensando..."):
             acao = decidir_acao(user_txt, tarefas, settings)
 
@@ -2168,4 +2175,12 @@ Responda direto, do jeito da Zoe (curto, útil, com gíria leve/emoji na medida)
             if b:
                 st.session_state.last_audio_bytes = b
 
+        clear_pending()
+
         st.rerun()
+
+# =========================
+# AUTO-REFRESH (somente quando o app está ocioso, pra não interromper resposta)
+# =========================
+if not st.session_state.get("pending_input"):
+    st_autorefresh(interval=AUTO_REFRESH_MS, key="tick")
