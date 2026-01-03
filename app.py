@@ -836,6 +836,22 @@ if "pending_usou_voz" not in st.session_state:
 if "pending_user_added" not in st.session_state:
     st.session_state.pending_user_added = False
 
+if "pending_set_at" not in st.session_state:
+    st.session_state.pending_set_at = 0.0
+
+# Se travar (crash/reload) no meio de uma resposta, pode ficar um "pending_input" preso.
+# Isso faz o user sentir que precisa enviar duas vezes. Então limpamos se estiver velho.
+try:
+    if st.session_state.pending_input and st.session_state.pending_set_at and (time.time() - float(st.session_state.pending_set_at) > 90):
+        st.session_state.pending_input = None
+        st.session_state.pending_usou_voz = False
+        st.session_state.pending_user_added = False
+        st.session_state.pending_set_at = 0.0
+except Exception:
+    pass
+
+
+
 
 # Rotinas: estado diário / dedupe
 if "settings" not in st.session_state:
@@ -1092,7 +1108,9 @@ _WEEKDAY_PT = [
 ]
 
 def is_date_question(tnorm: str) -> bool:
-    return bool(re.search(r"\b(que dia e hoje|que dia é hoje|qual a data|data de hoje|hoje e que dia|hoje é que dia)\b", tnorm))
+    # cobre variações tipo: "que dia é/era hoje?", "qual a data de hoje?", "hoje é que dia?"
+    return bool(re.search(r"\b(que dia (e|é|era) hoje|qual a data( de hoje)?|data de hoje|hoje (e|é) que dia)\b", tnorm))
+
 
 def is_time_question(tnorm: str) -> bool:
     return bool(re.search(r"\b(que horas|horas s[aã]o|que hora)\b", tnorm))
@@ -1351,6 +1369,11 @@ def parse_slash_command(raw: str) -> Optional[dict]:
     cmd = (m.group(1) or "").lower()
     arg = (m.group(2) or "").strip()
     if cmd == "web":
+        # Se o user forçou /web mas a intenção é cotação, usa o caminho de finanças (mais confiável).
+        tnorm = limpar_texto(arg)
+        tck = _extract_b3_ticker(arg)
+        if tck and any(k in tnorm for k in ["cotacao", "cotação", "preco", "preço", "valor", "quanto", "cotação hoje", "preço hoje"]):
+            return {"action": "FINANCE_QUOTE", "ticker": tck, "from_slash_web": True}
         return {"action": "WEB_SEARCH", "search_query": arg}
     if cmd == "chat":
         return {"action": "CHAT"}
@@ -1540,7 +1563,10 @@ def decidir_acao(texto: str, tarefas: list, settings: dict) -> dict:
         ])
         if wants_info:
             # Query expandida pra puxar páginas de finanças brasileiras
-            return {"action": "WEB_SEARCH", "search_query": f"{ticker} fundo imobiliário B3 o que é"}
+            if ticker == "KNCR11":
+                return {"action": "LOCAL_TICKER_INFO", "ticker": ticker}
+            # Query expandida pra puxar páginas de finanças brasileiras (evita dicionário aleatório)
+            return {"action": "WEB_SEARCH", "search_query": f"{ticker} FII B3 descrição"}
     # 3) heurística simples de coisas que pedem web
     if any(x in t for x in ["cotacao", "cotação", "preco", "preço", "noticia", "notícia", "quem ganhou", "resultado", "últimas", "atualizacao", "atualização"]):
         return {"action": "WEB_SEARCH", "search_query": texto}
@@ -1723,29 +1749,151 @@ def _get_secret(name: str, default=None):
         return default
 
 
+# =========================
+# FINANCE (cotações)
+# =========================
+_B3_TICKER_RE = re.compile(r"^[A-Z]{4}\d{1,2}$")
+
+def _is_b3_ticker(ticker: str) -> bool:
+    t = (ticker or "").strip().upper()
+    return bool(_B3_TICKER_RE.match(t))
+
+def _to_yahoo_symbol(ticker: str) -> str:
+    """Converte ticker B3 (ex: KNCR11) -> símbolo Yahoo (ex: KNCR11.SA)."""
+    t = (ticker or "").strip().upper()
+    if not t:
+        return ""
+    if t.endswith(".SA"):
+        return t
+    # padrão B3 (ações/FIIs) costuma usar sufixo .SA no Yahoo
+    if _is_b3_ticker(t):
+        return f"{t}.SA"
+    return t
+
+def fetch_yahoo_quote(ticker: str) -> dict:
+    """Consulta cotação direta no Yahoo Finance (sem chave)."""
+    symbol = _to_yahoo_symbol(ticker)
+    if not symbol:
+        return {}
+
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json,text/plain,*/*",
+    }
+
+    # Tenta endpoint de quote primeiro (mais leve), depois chart (tem meta também).
+    urls = [
+        f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={symbol}",
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1m&range=1d",
+    ]
+
+    last_err = None
+    for url in urls:
+        try:
+            r = requests.get(url, headers=headers, timeout=8)
+            if r.status_code != 200:
+                last_err = f"HTTP {r.status_code}"
+                continue
+            j = r.json() if r.content else {}
+            if "quoteResponse" in j:
+                items = (j.get("quoteResponse") or {}).get("result") or []
+                it = items[0] if items else {}
+                if isinstance(it, dict) and it.get("regularMarketPrice") is not None:
+                    it["_provider"] = "yahoo"
+                    it["_symbol"] = symbol
+                    return it
+            if "chart" in j:
+                res = (((j.get("chart") or {}).get("result") or [])[:1] or [{}])[0] or {}
+                meta = res.get("meta") or {}
+                if isinstance(meta, dict) and meta.get("regularMarketPrice") is not None:
+                    out = dict(meta)
+                    out["_provider"] = "yahoo"
+                    out["_symbol"] = symbol
+                    return out
+            last_err = "payload vazio"
+        except Exception as e:
+            last_err = str(e)
+
+    return {"_error": f"yahoo_fail:{last_err}"}
+
 def fetch_brapi_quote(ticker: str) -> dict:
     """Consulta cotação via brapi.dev (usa dados do Yahoo)."""
     ticker = (ticker or "").strip().upper()
     if not ticker:
         return {}
     token = os.environ.get("BRAPI_TOKEN") or _get_secret("BRAPI_TOKEN", None)
-    url = f"https://brapi.dev/api/quote/{ticker}"
-    params = {"range": "1d", "interval": "1d"}
-    if token:
-        params["token"] = token
-    try:
-        r = requests.get(url, params=params, timeout=8)
-        if r.status_code != 200:
-            return {}
-        j = r.json() if r.content else {}
-        res = (j.get("results") or [])
-        if not res:
-            return {}
-        it = res[0] or {}
-        return it if isinstance(it, dict) else {}
-    except Exception:
-        return {}
 
+    # brapi costuma aceitar tanto 'KNCR11' quanto 'KNCR11.SA' — tenta ambos
+    candidates = []
+    if ticker:
+        candidates.append(ticker)
+    if _is_b3_ticker(ticker):
+        candidates.append(f"{ticker}.SA")
+    if ticker.endswith(".SA") and _is_b3_ticker(ticker[:-3]):
+        candidates.append(ticker[:-3])
+
+    headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+
+    last_err = None
+    for tk in list(dict.fromkeys([c for c in candidates if c])):  # dedupe preservando ordem
+        url = f"https://brapi.dev/api/quote/{tk}"
+        params = {"range": "1d", "interval": "1d"}
+        if token:
+            params["token"] = token
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=8)
+            if r.status_code != 200:
+                last_err = f"HTTP {r.status_code}"
+                continue
+            j = r.json() if r.content else {}
+            res = (j.get("results") or [])
+            if not res:
+                last_err = "results vazio"
+                continue
+            it = res[0] or {}
+            if isinstance(it, dict) and it:
+                it["_provider"] = "brapi"
+                it["_symbol"] = tk
+                return it
+            last_err = "item inválido"
+        except Exception as e:
+            last_err = str(e)
+
+    return {"_error": f"brapi_fail:{last_err}"}
+
+def fetch_finance_quote(ticker: str) -> dict:
+    """Tenta cotação por múltiplas fontes (prioriza Yahoo direto, depois brapi)."""
+    # 1) Yahoo direto (normalmente mais estável do que depender de token da brapi)
+    q = fetch_yahoo_quote(ticker)
+    if q and not q.get("_error") and q.get("regularMarketPrice") is not None:
+        return q
+
+    # 2) brapi
+    q2 = fetch_brapi_quote(ticker)
+    if q2 and not q2.get("_error") and q2.get("regularMarketPrice") is not None:
+        return q2
+
+    # 3) se ambos falharam, devolve o erro mais útil
+    if q and q.get("_error"):
+        return q
+    if q2 and q2.get("_error"):
+        return q2
+    return {}
+
+
+
+def local_ticker_info_answer(ticker: str) -> str:
+    """Respostas locais (sem web) para tickers bem conhecidos — evita busca ruim."""
+    t = (ticker or "").strip().upper()
+    if t == "KNCR11":
+        return (
+            "**KNCR11** é o ticker do FII **Kinea Rendimentos Imobiliários** (B3).\n\n"
+            "- Tipo: geralmente classificado como **fundo de papel** (focado em crédito).\n"
+            "- Onde investe: majoritariamente em **CRIs** (Certificados de Recebíveis Imobiliários) e instrumentos de renda fixa ligados ao mercado imobiliário.\n"
+            "- Como costuma gerar rendimento: juros/recebíveis desses títulos (e pode variar com inflação/juros, dependendo do portfólio).\n\n"
+            "Se você me disser o que você quer analisar (risco, dividendos, preço, comparação com outro FII), eu direciono certinho."
+        )
+    return f"Esse ticker (**{t}**) parece ser da B3, mas eu precisaria pesquisar pra te dar a descrição exata sem chutar."
 
 def _fmt_money(v) -> str:
     try:
@@ -1756,11 +1904,18 @@ def _fmt_money(v) -> str:
 
 def format_quote_answer(ticker: str, quote: dict) -> str:
     """Monta resposta humaninha da cotação."""
-    if not quote:
-        return f"Não consegui puxar a cotação de **{ticker}** agora 😅 (pode ser instabilidade na API)."
+    ticker = (ticker or "").strip().upper()
+
+    # erros / vazio
+    if not quote or (isinstance(quote, dict) and quote.get("_error") and quote.get("regularMarketPrice") is None):
+        return (
+            f"Não consegui puxar a cotação de **{ticker}** agora 😅 "
+            "(pode ser instabilidade/limite na fonte). Tenta de novo em alguns segundos."
+        )
+
     price = quote.get("regularMarketPrice") or quote.get("price") or quote.get("regularMarketLastPrice")
     change_pct = quote.get("regularMarketChangePercent") or quote.get("changePercent")
-    upd = quote.get("regularMarketTime") or quote.get("updatedAt") or quote.get("regularMarketTime")  # epoch?
+    upd = quote.get("regularMarketTime") or quote.get("updatedAt")  # epoch ou string
     name = quote.get("longName") or quote.get("shortName") or quote.get("name") or ticker
 
     # horário (se vier em epoch)
@@ -1774,13 +1929,28 @@ def format_quote_answer(ticker: str, quote: dict) -> str:
     except Exception:
         upd_txt = ""
 
+    provider = (quote.get("_provider") or "").lower()
+    footer = ""
+    if provider == "yahoo":
+        footer = "📌 *Dados via Yahoo Finance (consulta direta).*"
+
+    elif provider == "brapi":
+        footer = "📌 *Dados via brapi.dev (Yahoo Finance).*"
+
+    else:
+        footer = "📌 *Dados via fonte externa.*"
+
+
     parts = [f"💹 **{ticker}** ({name}) tá em **{_fmt_money(price)}**"]
-    if isinstance(change_pct, (int, float)):
-        parts.append(f"({change_pct:+.2f}% no dia)")
+    try:
+        if isinstance(change_pct, (int, float)):
+            parts.append(f"({float(change_pct):+.2f}% no dia)")
+    except Exception:
+        pass
     if upd_txt:
         parts.append(f"• atualizado {upd_txt}")
-    parts.append("\n\n📌 *Dados via brapi.dev (Yahoo Finance).*")
-    return " ".join(parts).strip()
+    return (" ".join(parts).strip() + "\n\n" + footer).strip()
+
 
 
 def fetch_brapi_dividends_hint(ticker: str) -> dict:
@@ -2166,11 +2336,13 @@ def clear_pending():
     st.session_state.pending_input = None
     st.session_state.pending_usou_voz = False
     st.session_state.pending_user_added = False
+    st.session_state.pending_set_at = 0.0
 
 # Para evitar casos em que o usuário envia e um rerun/auto-refresh “engole” a mensagem,
 # a gente guarda a entrada em session_state e processa em seguida (de forma idempotente).
 if texto_input and st.session_state.pending_input is None and should_process_input(str(texto_input)):
     st.session_state.pending_input = str(texto_input).strip()
+    st.session_state.pending_set_at = time.time()
     st.session_state.pending_usou_voz = bool(usou_voz)
     st.session_state.pending_user_added = False
 
@@ -2277,10 +2449,15 @@ if user_txt:
                 else:
                     resp_txt = "Beleza… mas não peguei a data/hora 😅 Ex: *me lembra de X amanhã às 15:00*."
 
+            elif acao.get("action") == "LOCAL_TICKER_INFO":
+                ticker = (acao.get("ticker") or "").strip().upper()
+                resp_txt = local_ticker_info_answer(ticker)
+                add_event("ticker_info_local", ticker)
+
             elif acao.get("action") == "FINANCE_QUOTE":
                 finance_used = True
                 ticker = (acao.get("ticker") or "").strip().upper()
-                quote = fetch_brapi_quote(ticker)
+                quote = fetch_finance_quote(ticker)
                 resp_txt = format_quote_answer(ticker, quote)
                 add_event("finance_quote", f"{ticker}: {(quote or {}).get('regularMarketPrice')}")
 
@@ -2351,8 +2528,7 @@ if user_txt:
                             nome = (qdata.get("longName") or qdata.get("shortName") or qdata.get("companyName") or "").strip()
                         except Exception:
                             nome = ""
-
-                        q2 = f"{ticker_guess} {nome} fundo imobiliário B3 o que é".strip()
+                        q2 = f"{ticker_guess} {nome} FII fundo imobiliário B3 descrição".strip()
                         q2 = re.sub(r"\s+", " ", q2)
                         results2 = buscar_tavily(q2, max_results=5)
                         if results2:
