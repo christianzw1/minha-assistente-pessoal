@@ -1532,6 +1532,15 @@ def decidir_acao(texto: str, tarefas: list, settings: dict) -> dict:
         if wants_div:
             return {"action": "FINANCE_DIVIDENDS", "ticker": ticker}
 
+
+        # Se a pergunta for "o que é/quem é/sobre" + ticker, faz uma busca mais esperta (evita dicionário/Wikipedia aleatório).
+        wants_info = any(k in t for k in [
+            "o que e", "oq e", "o q e", "que e", "sobre", "significa", "defina", "explica", "do que se trata",
+            "fii", "fundo", "etf", "acao", "ação"
+        ])
+        if wants_info:
+            # Query expandida pra puxar páginas de finanças brasileiras
+            return {"action": "WEB_SEARCH", "search_query": f"{ticker} fundo imobiliário B3 o que é"}
     # 3) heurística simples de coisas que pedem web
     if any(x in t for x in ["cotacao", "cotação", "preco", "preço", "noticia", "notícia", "quem ganhou", "resultado", "últimas", "atualizacao", "atualização"]):
         return {"action": "WEB_SEARCH", "search_query": texto}
@@ -2306,15 +2315,58 @@ if user_txt:
                     add_event("web_search", "Q: (vazio)")
                 else:
                     st.session_state.last_web_query = q
+
+                    # --- Busca com "boost" para tickers B3/FIIs ---
+                    ticker_guess = _extract_b3_ticker(q) or _extract_b3_ticker(user_txt)
+                    tnorm_q = limpar_texto(q)
+                    wants_ticker_info = bool(ticker_guess) and any(k in tnorm_q for k in [
+                        "o que e", "oq e", "o q e", "que e", "sobre", "significa", "defina", "explica",
+                        "fii", "fundo", "acao", "ação", "etf"
+                    ])
+
+                    def _results_look_relevant(res: list, ticker: str) -> bool:
+                        if not ticker or not res:
+                            return False
+                        tck = ticker.lower()
+                        for it in res:
+                            if not isinstance(it, dict):
+                                continue
+                            txt = f"{it.get('title','')} {it.get('content','')} {it.get('url','')}".lower()
+                            # bom sinal: menciona o ticker
+                            if tck in txt:
+                                return True
+                            # bom sinal: contexto Brasil/B3/FII
+                            if any(k in txt for k in ["fii", "fundo imobili", "b3", "bolsa", "cvm", "cri", "kinea", "rendimentos imobili"]):
+                                return True
+                        return False
+
+                    # 1ª tentativa
                     results = buscar_tavily(q, max_results=5)
+
+                    # 2ª tentativa (só quando parece ticker e os resultados vieram nada a ver)
+                    if ticker_guess and wants_ticker_info and (not results or not _results_look_relevant(results, ticker_guess)):
+                        nome = ""
+                        try:
+                            qdata = fetch_brapi_quote(ticker_guess) or {}
+                            nome = (qdata.get("longName") or qdata.get("shortName") or qdata.get("companyName") or "").strip()
+                        except Exception:
+                            nome = ""
+
+                        q2 = f"{ticker_guess} {nome} fundo imobiliário B3 o que é".strip()
+                        q2 = re.sub(r"\s+", " ", q2)
+                        results2 = buscar_tavily(q2, max_results=5)
+                        if results2:
+                            results = results2
+                            st.session_state.last_web_query = q2
 
                     if not results:
                         resp_txt = "Não consegui puxar resultados confiáveis da web agora 😅 Tenta reformular a pergunta ou tentar daqui a pouco."
                     else:
                         web_used = True
-                        data = _llm_answer_from_web(user_txt, results)
+                        # Se foi /web, não deixa o '/web' contaminar a pergunta pro LLM
+                        question_for_llm = q if user_txt.strip().lower().startswith("/web") else user_txt
+                        data = _llm_answer_from_web(question_for_llm, results)
                         resp_txt = _render_web_json(data) if data else "Achei umas fontes, mas deu ruim pra montar a resposta 😅"
-
                     add_event("web_search", f"Q: {q}")
 
 
