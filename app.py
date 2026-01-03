@@ -1499,6 +1499,16 @@ def format_weather_reply(city_display: str, w: dict, day_offset: int) -> str:
     return line1
 
 
+def _extract_b3_ticker(texto: str) -> str:
+    """Tenta extrair um ticker B3 do texto (ex: KNCR11, PETR4)."""
+    if not texto:
+        return ""
+    m = re.search(r"\b([A-Za-z]{4}\d{1,2})\b", str(texto))
+    if not m:
+        return ""
+    return m.group(1).upper()
+
+
 def decidir_acao(texto: str, tarefas: list, settings: dict) -> dict:
     # 0) comandos slash primeiro (sem limpar_texto)
     cmd = parse_slash_command(texto)
@@ -1510,24 +1520,168 @@ def decidir_acao(texto: str, tarefas: list, settings: dict) -> dict:
     if wreq:
         return wreq
 
-    # 2) heurística simples de coisas que pedem web
+    # 2) finanças (cotação/dividendos) — tenta resolver por API antes de web/LLM
     t = limpar_texto(texto)
-    if any(x in t for x in ["cotação", "preço", "noticia", "notícia", "quem ganhou", "resultado", "últimas", "atualização"]):
+    ticker = _extract_b3_ticker(texto)
+
+    if ticker:
+        wants_price = any(k in t for k in ["cotacao", "cotação", "preco", "preço", "quanto ta", "quanto tá", "valor", "price"])
+        wants_div = any(k in t for k in ["dividendo", "dividendos", "rendimento", "rendimentos", "provento", "proventos", "pagamento", "data-com", "data com", "quando vou receber"])
+        if wants_price:
+            return {"action": "FINANCE_QUOTE", "ticker": ticker}
+        if wants_div:
+            return {"action": "FINANCE_DIVIDENDS", "ticker": ticker}
+
+    # 3) heurística simples de coisas que pedem web
+    if any(x in t for x in ["cotacao", "cotação", "preco", "preço", "noticia", "notícia", "quem ganhou", "resultado", "últimas", "atualizacao", "atualização"]):
         return {"action": "WEB_SEARCH", "search_query": texto}
 
-    # 3) fallback: roteador via LLM
+    # 4) fallback: roteador via LLM
     return router_llm(texto, tarefas)
+
 
 
 # =========================
 # WEB / AUDIO
 # =========================
-def buscar_tavily(q: str):
+def buscar_tavily(q: str, max_results: int = 5):
+    """Busca via Tavily e devolve uma lista de fontes (title/url/content)."""
+    q = (q or "").strip()
+    if not q:
+        return []
     try:
-        r = tavily.search(query=q, max_results=3)
-        return "\n".join([f"{i['title']}: {i['content']}" for i in r.get("results", [])])
+        r = tavily.search(query=q, max_results=int(max_results))
+        results = r.get("results", []) or []
+        cleaned = []
+        for it in results:
+            if not isinstance(it, dict):
+                continue
+            title = (it.get("title") or "").strip()
+            url = (it.get("url") or "").strip()
+            content = (it.get("content") or "").strip()
+            if not content and it.get("snippet"):
+                content = str(it.get("snippet") or "").strip()
+            if not (title or url or content):
+                continue
+            cleaned.append({"title": title, "url": url, "content": content})
+        return cleaned
     except Exception:
-        return None
+        return []
+
+
+def _format_tavily_sources(results: list, limit: int = 5) -> str:
+    """Formata as fontes de forma legível e rastreável (com URL)."""
+    out = []
+    try:
+        lim = max(1, int(limit))
+    except Exception:
+        lim = 5
+
+    for i, it in enumerate((results or [])[:lim], start=1):
+        if not isinstance(it, dict):
+            continue
+        title = (it.get("title") or "Fonte").strip()
+        url = (it.get("url") or "").strip()
+        content = (it.get("content") or "").strip()
+
+        # deixa o trecho curto (evita prompt gigante)
+        if len(content) > 650:
+            content = content[:650] + "…"
+
+        if url:
+            out.append(f"[{i}] {title}\nURL: {url}\nTrecho: {content}")
+        else:
+            out.append(f"[{i}] {title}\nTrecho: {content}")
+
+    return "\n\n".join(out).strip()
+
+def _llm_answer_from_web(user_question: str, tavily_results: list) -> dict:
+    """Pede pro LLM responder *somente* com base nas fontes, em JSON."""
+    sources_txt = _format_tavily_sources(tavily_results, limit=5)
+    user_question = (user_question or "").strip()
+
+    prompt = f"""{ZOE_PERSONA}
+
+Você recebeu fontes de busca na web.
+
+REGRAS (anti-alucinação):
+- Responda APENAS com base nas FONTES abaixo.
+- Se as fontes não trouxerem a informação necessária, diga claramente que **não achou**.
+- NÃO invente números (preço, %, datas, dividendos). Se não estiver nas fontes, não use.
+- Se citar um número, ele deve aparecer em algum Trecho das fontes.
+- Traga no máximo 3 fontes.
+
+FONTES:
+{sources_txt}
+
+PERGUNTA:
+{user_question}
+
+Retorne JSON estrito (apenas JSON) no formato:
+{{
+  "answer": "resposta final, curta e útil (tom da Zoe)",
+  "confidence": 0-100,
+  "missing": ["o que faltou nas fontes (opcional)"],
+  "used_sources": [
+    {{"title": "título", "url": "url", "note": "o que essa fonte sustenta"}}
+  ]
+}}
+
+Dica: Se não tiver fonte confiável, coloque confidence baixo e explique no campo answer.
+""".strip()
+
+    try:
+        resp = client.chat.completions.create(
+            model=MODEL_ID,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            response_format={"type": "json_object"},
+        ).choices[0].message.content
+        data = json.loads(resp)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def _render_web_json(data: dict) -> str:
+    """Transforma o JSON do LLM em texto final (com fontes)."""
+    data = data if isinstance(data, dict) else {}
+    ans = (data.get("answer") or "").strip()
+    used = data.get("used_sources") or []
+    conf = data.get("confidence")
+    missing = data.get("missing") or []
+
+    # fallback seguro
+    if not ans:
+        ans = "Achei alguns resultados, mas não ficou confiável o suficiente pra eu cravar 😅"
+
+    lines = [ans]
+
+    # se ficou incerto, deixa explícito (sem drama)
+    try:
+        if isinstance(conf, (int, float)) and float(conf) < 55:
+            lines.append("\n⚠️ *Tô com confiança baixa porque as fontes vieram fracas/contraditórias.*")
+    except Exception:
+        pass
+
+    if missing:
+        # 1-2 itens só, pra não virar textão
+        miss = "; ".join([str(x) for x in missing[:2] if str(x).strip()])
+        if miss:
+            lines.append(f"\n🧩 Faltou nas fontes: {miss}")
+
+    # fontes
+    cleaned = []
+    for it in used[:3]:
+        if not isinstance(it, dict):
+            continue
+        title = (it.get("title") or "Fonte").strip()
+        url = (it.get("url") or "").strip()
+        if url:
+            cleaned.append(f"- [{title}]({url})")
+    if cleaned:
+        lines.append("\n**Fontes:**\n" + "\n".join(cleaned))
+
+    return "\n".join(lines).strip()
 
 def ouvir_audio(uploaded_file):
     try:
@@ -1550,6 +1704,85 @@ def falar_bytes(texto: str):
         return b
     except Exception:
         return None
+# =========================
+# FINANÇAS (cotação/dividendos) - via API (sem "alucinação" de web)
+# =========================
+def _get_secret(name: str, default=None):
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
+
+
+def fetch_brapi_quote(ticker: str) -> dict:
+    """Consulta cotação via brapi.dev (usa dados do Yahoo)."""
+    ticker = (ticker or "").strip().upper()
+    if not ticker:
+        return {}
+    token = os.environ.get("BRAPI_TOKEN") or _get_secret("BRAPI_TOKEN", None)
+    url = f"https://brapi.dev/api/quote/{ticker}"
+    params = {"range": "1d", "interval": "1d"}
+    if token:
+        params["token"] = token
+    try:
+        r = requests.get(url, params=params, timeout=8)
+        if r.status_code != 200:
+            return {}
+        j = r.json() if r.content else {}
+        res = (j.get("results") or [])
+        if not res:
+            return {}
+        it = res[0] or {}
+        return it if isinstance(it, dict) else {}
+    except Exception:
+        return {}
+
+
+def _fmt_money(v) -> str:
+    try:
+        return f"R$ {float(v):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    except Exception:
+        return "—"
+
+
+def format_quote_answer(ticker: str, quote: dict) -> str:
+    """Monta resposta humaninha da cotação."""
+    if not quote:
+        return f"Não consegui puxar a cotação de **{ticker}** agora 😅 (pode ser instabilidade na API)."
+    price = quote.get("regularMarketPrice") or quote.get("price") or quote.get("regularMarketLastPrice")
+    change_pct = quote.get("regularMarketChangePercent") or quote.get("changePercent")
+    upd = quote.get("regularMarketTime") or quote.get("updatedAt") or quote.get("regularMarketTime")  # epoch?
+    name = quote.get("longName") or quote.get("shortName") or quote.get("name") or ticker
+
+    # horário (se vier em epoch)
+    upd_txt = ""
+    try:
+        if isinstance(upd, (int, float)) and upd > 10_000:
+            dt = datetime.fromtimestamp(float(upd), tz=FUSO_BR)
+            upd_txt = dt.strftime("%d/%m %H:%M")
+        elif isinstance(upd, str) and upd:
+            upd_txt = str(upd)
+    except Exception:
+        upd_txt = ""
+
+    parts = [f"💹 **{ticker}** ({name}) tá em **{_fmt_money(price)}**"]
+    if isinstance(change_pct, (int, float)):
+        parts.append(f"({change_pct:+.2f}% no dia)")
+    if upd_txt:
+        parts.append(f"• atualizado {upd_txt}")
+    parts.append("\n\n📌 *Dados via brapi.dev (Yahoo Finance).*")
+    return " ".join(parts).strip()
+
+
+def fetch_brapi_dividends_hint(ticker: str) -> dict:
+    """Tenta obter alguma info de dividendos (se a API fornecer)."""
+    q = fetch_brapi_quote(ticker)
+    # dependendo do payload, isso pode existir
+    div = q.get("dividendsData") or q.get("dividends") or {}
+    if isinstance(div, dict) and div:
+        return {"quote": q, "div": div}
+    return {"quote": q, "div": {}}
+
 
 
 # =========================
@@ -1893,6 +2126,8 @@ for m in st.session_state.memoria[-24:]:
             st.caption("🔎 Usei busca na web pra responder.")
         if m.get("weather_used"):
             st.caption("🌦️ Usei previsão do Open‑Meteo pra responder.")
+        if m.get("finance_used"):
+            st.caption("💹 Usei cotação via brapi.dev (Yahoo Finance).")
 
 
 # =========================
@@ -1953,6 +2188,7 @@ if st.session_state.pending_input:
 
 web_used = False
 weather_used = False
+finance_used = False
 resp_txt = ""
 
 # =========================
@@ -2032,8 +2268,36 @@ if user_txt:
                 else:
                     resp_txt = "Beleza… mas não peguei a data/hora 😅 Ex: *me lembra de X amanhã às 15:00*."
 
+            elif acao.get("action") == "FINANCE_QUOTE":
+                finance_used = True
+                ticker = (acao.get("ticker") or "").strip().upper()
+                quote = fetch_brapi_quote(ticker)
+                resp_txt = format_quote_answer(ticker, quote)
+                add_event("finance_quote", f"{ticker}: {(quote or {}).get('regularMarketPrice')}")
+
+            elif acao.get("action") == "FINANCE_DIVIDENDS":
+                finance_used = True
+                ticker = (acao.get("ticker") or "").strip().upper()
+                pack = fetch_brapi_dividends_hint(ticker)
+                quote = (pack or {}).get("quote") or {}
+                div = (pack or {}).get("div") or {}
+
+                # Se a API não trouxer dividendos, não chuta — direciona pro /web ou pede o rendimento por cota
+                if not div:
+                    base = ""
+                    if quote:
+                        base = format_quote_answer(ticker, quote) + "\n\n"
+                    resp_txt = (
+                        base
+                        + f"Sobre **dividendos/rendimentos** de **{ticker}**: eu não consegui puxar isso da API agora (nem sempre vem no payload).\n"
+                        + "Pra eu calcular certinho quanto você vai receber e as datas, me manda o **rendimento por cota** do último mês (ex: `R$ 1,05/cota`) "
+                        + f"ou usa **/web** assim: `/web rendimento por cota e data de pagamento {ticker}`"
+                    )
+                else:
+                    resp_txt = f"Tenho alguns dados de dividendos pra **{ticker}**, mas a estrutura da API pode variar.\n\nSe você me disser quantas cotas você tem, eu calculo o total. 😉"
+                add_event("finance_dividends", ticker)
+
             elif acao.get("action") == "WEB_SEARCH":
-                web_used = True
                 q = (acao.get("search_query") or "").strip()
 
                 # Se o usuário digitou só "/web" (sem consulta), não faz busca vazia.
@@ -2042,29 +2306,15 @@ if user_txt:
                     add_event("web_search", "Q: (vazio)")
                 else:
                     st.session_state.last_web_query = q
-                    res = buscar_tavily(q)
-                    if not res:
-                        resp_txt = "Não consegui puxar resultados da web agora 😅 Tenta de novo."
+                    results = buscar_tavily(q, max_results=5)
+
+                    if not results:
+                        resp_txt = "Não consegui puxar resultados confiáveis da web agora 😅 Tenta reformular a pergunta ou tentar daqui a pouco."
                     else:
-                        prompt_web = f"""
-{ZOE_PERSONA}
+                        web_used = True
+                        data = _llm_answer_from_web(user_txt, results)
+                        resp_txt = _render_web_json(data) if data else "Achei umas fontes, mas deu ruim pra montar a resposta 😅"
 
-Você recebeu resultados de busca na web (resuma e responda com base neles).
-RESULTADOS:
-{res}
-
-PERGUNTA DO USUÁRIO:
-{user_txt}
-
-Responda direto, do jeito da Zoe (curto, útil, com gíria leve/emoji na medida).
-""".strip()
-                        try:
-                            resp_txt = client.chat.completions.create(
-                                model=MODEL_ID,
-                                messages=[{"role": "user", "content": prompt_web}]
-                            ).choices[0].message.content
-                        except Exception:
-                            resp_txt = "Deu ruim pra consultar a web agora 😅 Tenta de novo daqui a pouquinho."
                     add_event("web_search", f"Q: {q}")
 
 
@@ -2133,29 +2383,11 @@ Regras rápidas:
                 # Auto-web: se a resposta ficou "não sei / usa /web", a Zoe pesquisa sozinha e volta com algo útil
                 if should_auto_web(user_txt, resp_txt):
                     q = user_txt
-                    res = buscar_tavily(q)
-                    if res:
+                    results = buscar_tavily(q, max_results=5)
+                    if results:
                         web_used = True
-                        prompt_web = f"""
-{ZOE_PERSONA}
-
-Você recebeu resultados de busca na web (resuma e responda com base neles).
-RESULTADOS:
-{res}
-
-PERGUNTA DO USUÁRIO:
-{user_txt}
-
-Responda direto, do jeito da Zoe (curto, útil, com gíria leve/emoji na medida).
-""".strip()
-                        try:
-                            resp_txt = client.chat.completions.create(
-                                model=MODEL_ID,
-                                messages=[{"role": "user", "content": prompt_web}],
-                                temperature=0.2
-                            ).choices[0].message.content
-                        except Exception:
-                            resp_txt = "Consegui buscar, mas deu ruim pra montar a resposta 😅 Tenta de novo?"
+                        data = _llm_answer_from_web(user_txt, results)
+                        resp_txt = _render_web_json(data) if data else "Consegui buscar, mas deu ruim pra montar a resposta 😅 Tenta de novo?"
                         add_event("web_search", f"Q: {q}")
                     else:
                         # sem resultado — mantém a resposta original
@@ -2166,6 +2398,8 @@ Responda direto, do jeito da Zoe (curto, útil, com gíria leve/emoji na medida)
             meta_flags["web_used"] = True
         if weather_used:
             meta_flags["weather_used"] = True
+        if finance_used:
+            meta_flags["finance_used"] = True
         chat_add("assistant", resp_txt, **meta_flags)
         add_event("chat_assistant", resp_txt)
 
