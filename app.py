@@ -834,6 +834,9 @@ if "pending_input" not in st.session_state:
 if "pending_usou_voz" not in st.session_state:
     st.session_state.pending_usou_voz = False
 
+if "busy" not in st.session_state:
+    st.session_state.busy = False
+
 
 # Rotinas: estado diário / dedupe
 if "settings" not in st.session_state:
@@ -851,6 +854,18 @@ if "awaiting_closing" not in st.session_state:
 
 
 ensure_chat_day_is_today()
+
+# =========================
+# RERUN SEGURO
+# =========================
+
+def safe_rerun():
+    """Rerun limpando a flag de processamento (evita bugs do auto-refresh)."""
+    try:
+        st.session_state.busy = False
+    except Exception:
+        pass
+    st.rerun()
 
 # =========================
 # UTILS TEMPO & FORMAT
@@ -1588,7 +1603,11 @@ def schedule_next(agora: datetime, t: dict) -> dict:
 # =========================
 # REFRESH LOOP
 # =========================
-st_autorefresh(interval=AUTO_REFRESH_MS, key="tick")
+# Se a Zoe estiver processando uma mensagem, desliga o auto-refresh pra não "engolir" a resposta.
+if st.session_state.get("busy"):
+    st_autorefresh(interval=0, key="tick")
+else:
+    st_autorefresh(interval=AUTO_REFRESH_MS, key="tick")
 
 agora = now_floor_minute()
 _raw_tarefas = carregar_tarefas()
@@ -1744,7 +1763,7 @@ with st.sidebar:
                 st.session_state.settings = save_uploaded_avatar(up, st.session_state.settings)
                 save_settings(st.session_state.settings)
                 st.toast("Avatar salvo ✅")
-                st.rerun()
+                safe_rerun()
 
         cur = (st.session_state.settings or {}).get("avatar_path") or "avatar.png"
         if os.path.exists(cur):
@@ -1807,7 +1826,7 @@ with st.sidebar:
                 st.session_state.settings = dict(s)
                 save_settings(st.session_state.settings)
                 st.toast("Configurações salvas ✅")
-                st.rerun()
+                safe_rerun()
 
         if s.get("lat") is not None and s.get("lon") is not None:
             st.caption(f"Lat/Lon: {float(s['lat']):.3f}, {float(s['lon']):.3f}")
@@ -1837,20 +1856,20 @@ with st.sidebar:
                     salvar_tarefas(tarefas)
                     update_summary_with_llm(f"Concluiu: {t['descricao']}")
                     add_event("task_done", f"Feito: {t['descricao']}")
-                    st.rerun()
+                    safe_rerun()
                 if c2.button("💤", key=f"sno_{t['id']}", help="Soneca +30min"):
                     t["next_remind_at"] = format_dt(now_floor_minute() + timedelta(minutes=30))
                     t["snoozed_until"] = t["next_remind_at"]
                     t["remind_count"] = 0
                     salvar_tarefas(tarefas)
                     add_event("task_snooze", f"Soneca: {t['descricao']} +30min")
-                    st.rerun()
+                    safe_rerun()
                 if c3.button("🔕", key=f"sil_{t['id']}", help="Silenciar"):
                     t["status"] = "silenciada"
                     t["next_remind_at"] = format_dt(now_floor_minute() + timedelta(days=365))
                     salvar_tarefas(tarefas)
                     add_event("task_silence", f"Silenciada: {t['descricao']}")
-                    st.rerun()
+                    safe_rerun()
                 st.divider()
 
     # ===== Memória =====
@@ -1879,7 +1898,7 @@ with st.sidebar:
         st.session_state.memoria = []
         save_chat_history(st.session_state.chat_day, st.session_state.memoria)
         st.toast("Chat limpo.")
-        st.rerun()
+        safe_rerun()
 
 # =========================
 # CHAT (ÚNICA COISA NA TELA PRINCIPAL)
@@ -1920,8 +1939,12 @@ if audio_val:
 # Para evitar casos em que o usuário envia e um rerun/auto-refresh “engole” a mensagem,
 # a gente guarda a entrada em session_state e processa em seguida.
 if texto_input and st.session_state.pending_input is None and should_process_input(str(texto_input)):
+    # Guarda a entrada e força um rerun imediato.
+    # Isso evita o bug clássico do Streamlit onde o auto-refresh interrompe a geração e você precisa enviar 2x.
     st.session_state.pending_input = str(texto_input).strip()
     st.session_state.pending_usou_voz = bool(usou_voz)
+    st.session_state.busy = True
+    st.rerun()
 
 
 # Defaults para evitar NameError quando não há input neste rerun
@@ -1960,7 +1983,7 @@ if user_txt:
         resp_txt = build_closing_prompt(now_floor_minute())
         chat_add("assistant", resp_txt)
         add_event("closing_prompt_manual", resp_txt)
-        st.rerun()
+        safe_rerun()
 
     # 2. Resposta de fechamento (se pendente)
     elif st.session_state.awaiting_closing and not user_txt.strip().startswith("/"):
@@ -1972,7 +1995,7 @@ if user_txt:
         resp_txt = "Fechou 😄 Registrei teu fechamento de hoje. Amanhã eu já ajusto o teu briefing/lembretes com base nisso."
         chat_add("assistant", resp_txt)
         add_event("chat_assistant", resp_txt)
-        st.rerun()
+        safe_rerun()
 
     # 3. Lógica Normal (ELSE) - só roda se não caiu nos anteriores
     else:
@@ -1984,7 +2007,7 @@ if user_txt:
             resp_txt = f"Agora no Brasil são **{agora_br.strftime('%H:%M')}** ({agora_br.strftime('%d/%m/%Y')})."
             chat_add("assistant", resp_txt)
             add_event("chat_assistant", resp_txt)
-            st.rerun()
+            safe_rerun()
 
         if is_date_question(tnorm):
             agora_br = now_br()
@@ -1992,13 +2015,13 @@ if user_txt:
             resp_txt = f"Hoje é **{wd}**, **{agora_br.strftime('%d/%m/%Y')}**."
             chat_add("assistant", resp_txt)
             add_event("chat_assistant", resp_txt)
-            st.rerun()
+            safe_rerun()
 
         if is_memory_question(tnorm):
             resp_txt = summarize_previous_user_messages(st.session_state.memoria, k=5)
             chat_add("assistant", resp_txt)
             add_event("chat_assistant", resp_txt)
-            st.rerun()
+            safe_rerun()
 
 
         with st.spinner(f"{ASSISTANT_NAME} tá pensando..."):
@@ -2168,4 +2191,4 @@ Responda direto, do jeito da Zoe (curto, útil, com gíria leve/emoji na medida)
             if b:
                 st.session_state.last_audio_bytes = b
 
-        st.rerun()
+        safe_rerun()
